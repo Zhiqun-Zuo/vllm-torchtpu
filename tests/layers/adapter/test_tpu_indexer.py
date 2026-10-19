@@ -574,3 +574,13 @@ def test_streamidx_block_sizes_mixed_kv_pages():
         (2, 2, STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP),
         (1, 128, 4),
     )
+
+
+def test_streamidx_mixed_kv_pages_default_is_4(monkeypatch):
+    """The mixed-pass kv block defaults to 4 pages and reads the env."""
+    from vllm_torchtpu import envs
+
+    monkeypatch.delenv("TPU_STREAMIDX_MIXED_KV_PAGES", raising=False)
+    assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 4
+    monkeypatch.setenv("TPU_STREAMIDX_MIXED_KV_PAGES", "2")
+    assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 2

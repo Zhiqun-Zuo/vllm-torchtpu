@@ -299,15 +299,14 @@ class TcKvWriterDispatchTest(parameterized.TestCase):
         )
 
     def _run(self, inp, flag):
-        env = {FLAG: "1"} if flag else {}
+        # On by default: the off arm sets it to 0.
+        env = {FLAG: "1" if flag else "0"}
         with (
             mock.patch.dict(os.environ, env),
             mock.patch.object(
                 tc_scatter, "scatter_caches", wraps=tc_scatter.scatter_caches
             ) as spy,
         ):
-            if not flag:
-                os.environ.pop(FLAG, None)
             out = [self._dcp(inp, rank) for rank in range(DCP_SIZE)]
         return out, spy.call_count
 
@@ -386,9 +385,11 @@ class TcKvWriterContractTest(parameterized.TestCase):
         _, rope_spec = _specs(rope_layout)
         self.assertFalse(tc_scatter.supports(nope_spec, rope_spec, 16))
 
-    def test_flag_defaults_off(self):
+    def test_flag_defaults_on(self):
         from vllm_torchtpu import envs
 
         with mock.patch.dict(os.environ):
             os.environ.pop(FLAG, None)
+            self.assertTrue(envs.TPU_MLA_TC_KV_WRITER)
+            os.environ[FLAG] = "0"
             self.assertFalse(envs.TPU_MLA_TC_KV_WRITER)

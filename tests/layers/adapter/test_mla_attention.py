@@ -1281,18 +1281,33 @@ def test_dcp_indexer_a2a_is_chosen_per_bucket(
     assert _dcp_indexer_a2a_for_bucket(num_tokens, enabled, min_tokens) is expected
 
 
+def test_dcp_indexer_a2a_default_steps_aside_on_indivisible_bucket(monkeypatch):
+    """The all-to-all splits the bucket over the DCP ranks: when it is on
+    without being set (a caller passing enabled=True), a bucket that does not
+    divide keeps the all-gather merge; set explicitly, it still reaches the
+    kernel (which refuses it)."""
+    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
+    assert _dcp_indexer_a2a_for_bucket(72, True, 64, dcp_size=16) is False
+    assert _dcp_indexer_a2a_for_bucket(128, True, 64, dcp_size=16) is True
+    assert _dcp_indexer_a2a_for_bucket(72, True, 64, dcp_size=6) is True
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")
+    assert _dcp_indexer_a2a_for_bucket(72, True, 64, dcp_size=16) is True
+
+
 def test_dcp_indexer_a2a_env_defaults_and_forwarding(monkeypatch):
-    """Off by default, threshold 64, and both reach the workers on multi-host."""
+    """On by default, threshold 64, and both reach the workers on multi-host."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", raising=False)
-    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 64
 
     monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")
-    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "0")
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 256
 
     monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "-1")

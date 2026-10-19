@@ -570,6 +570,49 @@ class TestTpuPlatform:
         ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
         assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
 
+    @pytest.mark.parametrize(
+        ("spec", "dcp", "env", "added"),
+        [
+            # The default "4,8" applies only to spec decode under DCP, where
+            # it was measured (~130 s of cold compile elsewhere for nothing).
+            (False, 1, None, []),
+            (True, 1, None, []),
+            (False, 16, None, []),
+            (True, 16, None, [4, 8]),
+            # Set explicitly, it applies anywhere; empty turns it off.
+            (False, 1, "4,8", [4, 8]),
+            (True, 16, "", []),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_token_bucket_extra_default_needs_spec_decode_and_dcp(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        spec,
+        dcp,
+        env,
+        added,
+    ):
+        if env is None:
+            monkeypatch.delenv("TPU_TOKEN_BUCKET_EXTRA", raising=False)
+        else:
+            monkeypatch.setenv("TPU_TOKEN_BUCKET_EXTRA", env)
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.speculative_config = MagicMock() if spec else None
+        vllm_config.parallel_config.decode_context_parallel_size = dcp
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
     def test_linear_token_step_at_the_served_budget(self):
         paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
 

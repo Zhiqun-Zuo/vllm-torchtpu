@@ -82,6 +82,9 @@ _ARM_DEFAULTS = {
     "TPU_DCP_LSE_MERGE_A2A_PACK": False,
     "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": False,
     "TPU_DCP_MERGE_RS_BF16": 0,
+    # The chunk arms keep their own chunk count (on by default: 2 chunks for
+    # the buckets that gather their lse once).
+    "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {

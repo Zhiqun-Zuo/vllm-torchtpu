@@ -5162,10 +5162,13 @@ class TPUModelRunner(GPUModelRunner):
 
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
-            from vllm_torchtpu.layers.adapter.moe_tp_decode import arm
+            from vllm_torchtpu.layers.adapter.moe_tp_decode import arm, should_arm
 
-            draft = self._async_drafter.draft_model if self._is_async_drafter else None
-            arm(self.model, draft)
+            if should_arm():
+                draft = (
+                    self._async_drafter.draft_model if self._is_async_drafter else None
+                )
+                arm(self.model, draft)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()

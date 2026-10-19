@@ -201,7 +201,7 @@ def _dcp(dcp, flag, kv_write_fault=None):
         ) as gather_spy,
     ):
         if not flag:
-            os.environ.pop(FLAG, None)
+            os.environ[FLAG] = "0"  # on by default
         extra = {} if kv_write_fault is None else {"kv_write_fault": kv_write_fault}
         res = prologue._dcp_run(dcp, candidate=True, **extra)
         writes_in_gather = sum(
@@ -269,11 +269,13 @@ def test_dcp_positive_control_fails(fault):
         assert any(sum(diff.values(), [])), f"fault {fault} not caught"
 
 
-def test_flag_defaults_off():
+def test_flag_defaults_on():
     from vllm_torchtpu import envs
 
     with mock.patch.dict(os.environ):
         os.environ.pop(FLAG, None)
+        assert envs.TPU_MLA_KV_WRITE_IN_GATHER
+        os.environ[FLAG] = "0"
         assert not envs.TPU_MLA_KV_WRITE_IN_GATHER
 
 

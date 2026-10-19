@@ -734,3 +734,153 @@ def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name, reta
             retain,
         )
     )
+
+
+# --- A token-count branch whose sides lift different SymInts ---------------
+#
+# Two dynamic inputs get two symbols. A side of the branch that combines them
+# elementwise proves them equal and the second symbol disappears from its
+# graph's inputs; the other side never relates them and lifts both. The
+# tensors are the same on both sides, so the hand-over must not be refused
+# (GLM-5.2 warmup failed this way at the 32 / 64 bucket boundary: 2079 inputs
+# against 2078, one SymInt apart).
+
+TIE_ROWS = 32
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0, "positions": 0})
+class TiedSymbolsModel(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        p = positions.to(x.dtype)
+        # x + p ties the positions' length to the rows; x * sum(p) leaves it
+        # free: its symbol is an input of its own.
+        y = x + p.unsqueeze(-1) if x.shape[0] > TIE_ROWS else x * p.sum()
+        return WAVE(y)
+
+
+def _run_tied(model, config, num_tokens):
+    with set_forward_context({}, config):
+        return model(
+            torch.zeros(num_tokens, HIDDEN), torch.zeros(num_tokens, dtype=torch.long)
+        )
+
+
+def _scalar_only_difference_hands_buckets_over(cache_root):
+    buckets = [16, 64]
+    config, backend = prepare(cache_root)
+    config.compilation_config.compile_sizes = buckets
+    model = build(TiedSymbolsModel, config)
+    symints = []
+    original = tpu_compiler.TpuCompilerAdaptor.compile
+
+    def capture(self, graph, *args, **kwargs):
+        symints.append(
+            sum(
+                isinstance(shape_variants._placeholder_value(n), torch.SymInt)
+                for n in shape_variants._placeholder_nodes(graph)
+            )
+        )
+        return original(self, graph, *args, **kwargs)
+
+    tpu_compiler.TpuCompilerAdaptor.compile = capture
+    try:
+        with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+            for num_tokens in buckets:
+                if tracked.needs_retrace(num_tokens):
+                    shape_variants.retrace(model, config)
+                _run_tied(model, config, num_tokens)
+    finally:
+        tpu_compiler.TpuCompilerAdaptor.compile = original
+    # The premise: the two traces really lift a different number of SymInts.
+    assert len(set(symints)) == 2, symints
+    assert backend.compiled == [(16, 1), (64, 1)]
+    CALLS.clear()
+    for num_tokens in (16, 64, 16):
+        assert _run_tied(model, config, num_tokens).shape[0] == num_tokens
+    assert CALLS == [(16, 1), (64, 1), (16, 1)]
+
+
+def test_branch_lifting_a_different_symint_set_hands_buckets_over(tmp_path):
+    in_child(partial(_scalar_only_difference_hands_buckets_over, str(tmp_path)))
+
+
+def _symint(value: int):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import (
+        DimDynamic,
+        ShapeEnv,
+        StatelessSymbolicContext,
+    )
+
+    mode = FakeTensorMode(shape_env=ShapeEnv())
+    fake = mode.from_tensor(
+        torch.empty(value),
+        symbolic_context=StatelessSymbolicContext(dynamic_sizes=[DimDynamic.DYNAMIC]),
+    )
+    return fake.shape[0]
+
+
+def test_handover_fills_a_symint_only_the_executable_takes():
+    metas = {
+        "s72": _symint(8),
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "s80": _symint(8),
+        "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir", "key", _stub_graph(list(metas), metas), lambda *a: received.append(a)
+    )
+    current = ["s72", "gate_weight", "hidden_states"]  # no s80, reordered
+    runnable = session.get("dir", "key", _stub_graph(current, metas), 32)
+    runnable(32, "gate", "hidden")
+    # The executable's own s80 is the constant it was compiled with.
+    assert received == [(32, "hidden", 32, "gate")]
+    # Without the bucket size there is nothing to fill it with.
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="s80"):
+        session.get("dir", "key", _stub_graph(current, metas))
+
+
+def test_handover_drops_a_symint_only_this_trace_takes():
+    metas = {
+        "s72": _symint(8),
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "s80": _symint(8),
+    }
+    session = shape_variants.BucketExecutables()
+    received = []
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["s72", "hidden_states"], metas),
+        lambda *a: received.append(a),
+    )
+    runnable = session.get(
+        "dir", "key", _stub_graph(["s72", "hidden_states", "s80"], metas), 16
+    )
+    runnable(16, "hidden", 16)
+    assert received == [(16, "hidden")]
+
+
+def test_handover_still_refuses_a_tensor_difference_beside_a_symint_one():
+    metas = {
+        "s80": _symint(8),
+        "hidden_states": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "gate_weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+        "router_bias": torch.empty(2, dtype=torch.bfloat16),
+    }
+    session = shape_variants.BucketExecutables()
+    session.put(
+        "dir",
+        "key",
+        _stub_graph(["s80", "hidden_states", "gate_weight"], metas),
+        lambda *a: a,
+    )
+    with pytest.raises(shape_variants.ShapeSpecializationError, match="router_bias"):
+        session.get(
+            "dir", "key", _stub_graph(["hidden_states", "router_bias"], metas), 16
+        )

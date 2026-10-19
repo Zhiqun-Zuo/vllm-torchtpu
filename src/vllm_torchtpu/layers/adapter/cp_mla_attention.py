@@ -204,13 +204,22 @@ def _merge_chunks(num_tokens: int) -> int:
     """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
     merge into: 1 (unsplit) unless the bucket reaches
     `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` and splits into equal chunks whose
-    length is a multiple of 8 (the f32 sublane tile)."""
+    length is a multiple of 8 (the f32 sublane tile).
+
+    TPU_DCP_MERGE_CHUNKED_SMALL=m (>= 2): the buckets that gather their lse
+    once (TPU_DCP_MERGE_CHUNKED_LSE_AG, at most
+    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS tokens) split into m chunks
+    instead. The comparison is the one `_lse_gathered_once` already makes for
+    the same bucket, so it adds no shape guard."""
     chunks = envs.TPU_DCP_MERGE_CHUNKED
-    if (
-        chunks <= 1
-        or num_tokens < envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS
-        or num_tokens % (8 * chunks)
+    if chunks <= 1 or not (
+        num_tokens > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS)
     ):
+        return 1
+    small = envs.TPU_DCP_MERGE_CHUNKED_SMALL
+    if small >= 2 and _lse_gathered_once(num_tokens):
+        chunks = small
+    if num_tokens % (8 * chunks):
         return 1
     return chunks
 

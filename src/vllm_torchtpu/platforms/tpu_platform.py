@@ -779,6 +779,17 @@ class TpuPlatform(Platform):
             scheduler_config = vllm_config.scheduler_config
             budget = scheduler_config.max_num_batched_tokens
             extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            dcp_size = getattr(
+                vllm_config.parallel_config, "decode_context_parallel_size", 1
+            )
+            if not envs.is_set("TPU_TOKEN_BUCKET_EXTRA") and not (
+                getattr(vllm_config, "speculative_config", None) is not None
+                and isinstance(dcp_size, int)
+                and dcp_size > 1
+            ):
+                # The default (sub-16 MTP decode buckets) was measured with
+                # spec decode under DCP; elsewhere it only adds cold compile.
+                extra_bucket_sizes = []
             if envs.TPU_TOKEN_BUCKET_LINEAR:
                 extra_bucket_sizes += _get_linear_token_paddings(
                     budget,

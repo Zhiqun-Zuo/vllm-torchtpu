@@ -1895,3 +1895,51 @@ class MaskedDenseAdmissionTest(parameterized.TestCase):
         self.assertFalse(self._admit(runner, num_heads=16).allow_masked_dense)
         self.assertTrue(self._admit(runner).allow_masked_dense)
         self.assertIs(runner._masked_dense_groups_requests, False)
+
+
+# --- Defaults that step aside where the top-k cap does not apply ------------
+
+
+def _sc_specs():
+    return tuple(
+        SparseMLAKVCacheSpec.create(
+            t, KVCacheLayout.SPARSECORE, TOTAL_PAGES, 256, d, KV_PACKING
+        )
+        for t, d in ((KVCacheType.NOPE, LKV_DIM), (KVCacheType.ROPE, ROPE_DIM))
+    )
+
+
+@pytest.mark.parametrize(
+    "cap,dcp,want",
+    [(-1, 16, 512), (-1, 8, 512), (-1, 4, 0), (-1, 2, 0), (0, 16, 0), (256, 2, 256)],
+)
+def test_dcp_mla_topk_cap_resolves_auto(monkeypatch, cap, dcp, want):
+    monkeypatch.setattr(envs, "TPU_DCP_MLA_TOPK_CAP", cap)
+    assert attention_interface.dcp_mla_topk_cap(dcp) == want
+
+
+@pytest.mark.parametrize("dcp,want", [(16, True), (8, True), (4, False), (2, False)])
+def test_kv_write_in_gather_needs_the_resolved_cap(monkeypatch, dcp, want):
+    """The default auto cap (-1) is off below DCP8: no fused-prep gather runs
+    there, so the KV write must stay with the cache writer (the kernel refuses
+    a kv_write without that gather)."""
+    monkeypatch.setattr(envs, "TPU_DCP_MLA_TOPK_CAP", -1)
+    nope, rope = _sc_specs()
+    got = attention_interface.kv_write_in_gather_supported(nope, rope, 16, 2048, dcp)
+    assert got is want
+
+
+def test_row_widths_default_steps_aside(monkeypatch):
+    """Default widths fit the auto cap of 512; without a cap they are dropped,
+    under a smaller explicit cap only the ones below it stay. Explicit widths
+    reach the kernel as given (it refuses those it cannot take)."""
+    name = "TPU_DCP_MLA_MIXED_LIVE_WIDTHS"
+    monkeypatch.delenv(name, raising=False)
+    widths = attention_interface._row_widths
+    assert widths(name, "256,384", 512) == (256, 384)
+    assert widths(name, "256,384", 0) == ()
+    assert widths(name, "256,384", 256) == ()
+    assert widths(name, "128,256,384", 384) == (128, 256)
+    monkeypatch.setenv(name, "256,384")
+    assert widths(name, "256,384", 0) == (256, 384)
+    assert widths(name, "256,384", 256) == (256, 384)

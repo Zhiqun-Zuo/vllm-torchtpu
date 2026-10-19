@@ -417,6 +417,47 @@ def test_default_skips_a_neox_rope(monkeypatch):
     assert not getattr(w.mla_attn, "post_load_hooks", [])
 
 
+def _construct_sparse_qrep(nope):
+    """A sparse wrapper whose q projection is query-replicated (DCP qrep)."""
+    q_b = torch.nn.Identity()
+    q_b.qrep_active, q_b.group_size = True, 1
+    modules = _modules(_rope())
+    modules.q_b_proj, modules.is_sparse = q_b, True
+    with patch.object(mla_op, "VllmTPUMLAAttention", return_value=_Attn()):
+        return VllmMultiHeadLatentAttentionWrapper(
+            hidden_size=HIDDEN,
+            num_heads=4,
+            scale=1.0,
+            qk_nope_head_dim=nope,
+            qk_rope_head_dim=ROPE,
+            v_head_dim=V_DIM,
+            q_lora_rank=Q_LORA,
+            kv_lora_rank=KV_LORA,
+            mla_modules=modules,
+        )
+
+
+@pytest.mark.parametrize("split_q_lse", [True, False])
+@pytest.mark.parametrize("nope", [NOPE, 128])
+def test_decode_prologue_default_steps_aside(monkeypatch, nope, split_q_lse):
+    """On by default: a q head other than 192 + 64 (DeepSeek-V3.2's 128 + 64)
+    or no split q/lse keeps the torch-side q rope instead of refusing."""
+    monkeypatch.delenv("TPU_MLA_DECODE_PROLOGUE", raising=False)
+    monkeypatch.setattr(envs, "TPU_MLA_DECODE_PROLOGUE", True)
+    monkeypatch.setattr(envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q_lse)
+    w = _construct_sparse_qrep(nope)
+    assert w.decode_prologue is (nope == NOPE and split_q_lse)
+
+
+@pytest.mark.parametrize("nope,split_q_lse", [(128, True), (NOPE, False)])
+def test_decode_prologue_explicit_still_refuses(monkeypatch, nope, split_q_lse):
+    monkeypatch.setenv("TPU_MLA_DECODE_PROLOGUE", "1")
+    monkeypatch.setattr(envs, "TPU_MLA_DECODE_PROLOGUE", True)
+    monkeypatch.setattr(envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q_lse)
+    with pytest.raises(NotImplementedError, match="TPU_MLA_DECODE_PROLOGUE"):
+        _construct_sparse_qrep(nope)
+
+
 # --------------------------------------------------------------------------
 # Kernel level (TPU): the wrapper's tensors through the real caches + kernels.
 # --------------------------------------------------------------------------

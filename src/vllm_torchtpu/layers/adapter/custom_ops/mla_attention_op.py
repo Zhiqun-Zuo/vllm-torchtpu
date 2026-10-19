@@ -265,15 +265,25 @@ def _resolve_indexer_kv_cache_mode(
 
 
 def _dcp_indexer_a2a_for_bucket(
-    num_tokens: int, enabled: bool, min_tokens: int
+    num_tokens: int, enabled: bool, min_tokens: int, dcp_size: int = 1
 ) -> bool:
     """Whether the DCP indexer merge for this token bucket uses the all-to-all.
 
     `num_tokens` is the static padded bucket, so this picks one merge per
     compiled variant: decode-sized buckets keep the all-gather merge and
-    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    prefill-sized ones (buckets of at least `min_tokens`, tested as
+    `num_tokens > envs.bucket_gate_edge(min_tokens)`: the cap rule) take the
+    all-to-all. The all-to-all splits the bucket over the DCP ranks; a bucket
+    that does not divide keeps the all-gather unless TPU_DCP_INDEXER_A2A_MERGE
+    was set.
     """
-    return enabled and num_tokens >= min_tokens
+    if (
+        enabled
+        and num_tokens % dcp_size
+        and not envs.is_set("TPU_DCP_INDEXER_A2A_MERGE")
+    ):
+        return False
+    return enabled and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
 def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -726,7 +736,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode_chunked=skip_empty_decode_chunked,
                 chunk_tokens=chunk_tokens,
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
-                    q.shape[0], a2a_merge, a2a_min_tokens
+                    q.shape[0], a2a_merge, a2a_min_tokens, dcp_size
                 ),
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
@@ -1741,6 +1751,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and self.dcp_q_replicate
             and self.rotary_emb is not None
         )
+        if self.decode_prologue and not envs.is_set("TPU_MLA_DECODE_PROLOGUE"):
+            # On by default; a q head or q layout the kernel prologue cannot
+            # take keeps the torch-side q rope unless the env was set.
+            self.decode_prologue = envs.TPU_MLA_SPARSE_SPLIT_Q and (
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            ) == (192, 64)
         if self.decode_prologue:
             if not envs.TPU_MLA_SPARSE_SPLIT_Q:
                 raise NotImplementedError(

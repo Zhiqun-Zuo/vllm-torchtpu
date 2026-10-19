@@ -396,6 +396,31 @@ def test_refuses_without_the_padding_mask(harness, monkeypatch):
     assert "TPU_MOE_SKIP_PADDED_TOKENS" in harness.logs[-1]
 
 
+@pytest.mark.parametrize(
+    ("flag", "skip_padded", "want"),
+    [
+        (None, "1", True),  # on by default, with the padding mask: arm
+        # On by default without the mask every layer would refuse: the default
+        # skips arming (and its collectives) outright.
+        (None, "0", False),
+        ("1", "0", True),  # explicit: arm, and log why each layer was refused
+        ("0", "1", False),
+    ],
+)
+def test_should_arm(monkeypatch, flag, skip_padded, want):
+    envs = moe_tp_decode.envs
+    if flag is None:
+        monkeypatch.delenv("USE_MOE_TP_DECODE_KERNEL", raising=False)
+    else:
+        monkeypatch.setenv("USE_MOE_TP_DECODE_KERNEL", flag)
+    # The values, also as attributes (a test elsewhere may have pinned them).
+    monkeypatch.setattr(envs, "USE_MOE_TP_DECODE_KERNEL", flag != "0", raising=False)
+    monkeypatch.setattr(
+        envs, "TPU_MOE_SKIP_PADDED_TOKENS", skip_padded == "1", raising=False
+    )
+    assert bool(moe_tp_decode.should_arm()) is want
+
+
 def test_refuses_when_the_moe_path_owns_its_collectives(harness, monkeypatch):
     monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
     model = harness.model({})

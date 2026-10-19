@@ -912,6 +912,7 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
         "TPU_DCP_MERGE_RS_BF16": 0,
+        "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
         # f32 reduce-scatter wire, the reference these checks compare against
         # (#1808 narrows it to bf16 by default; test_rs_out_precision_* below).
         "TPU_DCP_RS_OUT_PRECISION": False,
@@ -1066,6 +1067,7 @@ def test_merge_chunks_per_bucket(
     monkeypatch.setattr(
         cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", min_tokens, raising=False
     )
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_MERGE_CHUNKED_SMALL", 0, raising=False)
     calls = []
     monkeypatch.setattr(
         cp_mla,
