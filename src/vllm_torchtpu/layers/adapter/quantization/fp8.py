@@ -91,8 +91,10 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     get_fp8_linear_pallas_op,
+    prequantized_matmul,
     quantized_matmul,
     quantized_matmul_pallas,
 )
@@ -1741,7 +1743,16 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+        slot = getattr(layer, PREQUANT_ATTR, None)
+        prequant = None if slot is None else slot.value
+        if prequant is not None:
+            # TPU_FUSED_ADD_RMSNORM_QUANT: the norm that produced `x` also wrote
+            # its per-row fp8 quant, equal to the one quantized_matmul computes.
+            slot.value = None
+            x_q, x_scale = prequant
+            out = prequantized_matmul(x_q, x_scale, weight, layer.weight_scale)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+        elif getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
             # Only a DCP indexer layer's q_b_proj under TPU_IDX_TOPK_SCHED_GROUPS
             # carries a group; every other call is unchanged.
             sched_group = getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None)

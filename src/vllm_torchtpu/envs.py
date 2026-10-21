@@ -239,6 +239,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
@@ -1575,6 +1576,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
         "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
     ),
+    # With TPU_FUSED_ADD_RMSNORM, a residual-stream norm that feeds a per-channel
+    # FP8 linear also writes the linear's fp8 activation and per-row scale, so
+    # the linear skips its own activation quant.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense

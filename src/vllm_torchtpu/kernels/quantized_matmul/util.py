@@ -112,6 +112,39 @@ def xla_quantized_matmul(
     return out.astype(x.dtype)
 
 
+def xla_prequantized_matmul(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> jax.Array:
+    """``xla_quantized_matmul`` on an activation that is already quantized.
+
+    Gives the same result bit for bit when ``(x_q, x_scale)`` is
+    ``quantize_tensor(x, w_q.dtype)``.
+
+    Args:
+        x_q: Quantized activation. [num_tokens, n_input_features]
+        x_scale: Per-row activation scale, f32. [num_tokens, 1]
+        w_q: Weight quantized array. [n_input_features, n_output_features]
+        w_scale: Weight quantization scale. [n_output_features]
+        out_dtype: Output dtype.
+    """
+    acc_dtype = jnp.float32
+    if jnp.issubdtype(w_q.dtype, jnp.integer):
+        acc_dtype = jnp.int32
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=acc_dtype,
+    ).astype(jnp.float32)
+    out *= x_scale
+    out *= jnp.expand_dims(w_scale, 0)
+    return out.astype(out_dtype)
+
+
 def xla_quantized_batched_matmul(
     x: jax.Array,
     w_q: jax.Array,

@@ -14,7 +14,10 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -51,6 +54,25 @@ FP8_PALLAS_SCALE = "weight_scale_pallas"
 # TPU_IDX_TOPK_SCHED_GROUPS: the kernel's XLA scheduling group, on a DCP indexer
 # layer's q_b_proj (G2: it runs under the cross-rank SparseCore top-k).
 FP8_PALLAS_SCHED_GROUP_ATTR = "_tpu_fp8_pallas_sched_group"
+# TPU_FUSED_ADD_RMSNORM_QUANT: the PrequantSlot that a per-channel FP8 linear
+# shares with the norm in front of it. The norm puts `(x_q, x_scale)` in it and
+# `apply` takes and clears it.
+PREQUANT_ATTR = "_tpu_prequant_slot"
+
+
+class PrequantSlot:
+    """Holds a norm's quantized output until its paired linear reads it.
+
+    The norm holds this object instead of the linear module. Otherwise Dynamo
+    reaches the linear's weights through the norm on one side of the
+    token-count branch only, and the two traces lift the same buffers under
+    different names.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = None
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -159,6 +181,55 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+_prequantized_matmul_op: Callable | None = None
+
+
+def _prequantized_matmul_jax(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+def get_prequantized_matmul_op() -> Callable:
+    """Build (once, at load -- outside Dynamo) the prequantized matmul op."""
+    global _prequantized_matmul_op
+    if _prequantized_matmul_op is not None:
+        return _prequantized_matmul_op
+    with _quantized_matmul_kernel_op_lock:
+        if _prequantized_matmul_op is not None:
+            return _prequantized_matmul_op
+        op = pallas.jax_op("pallas::prequantized_matmul", _prequantized_matmul_jax)
+
+        def _fake(x_q, x_scale, w_q, w_s):
+            del x_scale, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake)
+        _prequantized_matmul_op = op
+        return op
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor, x_scale: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """Per-channel FP8 linear on an activation quantized upstream.
+
+    Equals ``quantized_matmul(x, w_q, w_s)`` bit for bit when
+    ``(x_q, x_scale)`` is ``quantize_tensor(x)``. ``w_q`` is (k, n), ``w_s``
+    is [n]. Called inside the compiled forward, so it only reads the op:
+    Dynamo cannot trace the lock in ``get_prequantized_matmul_op``.
+    """
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "The prequantized matmul op must be built at load: call "
+            "get_prequantized_matmul_op() first (rmsnorm.arm_prequant does)."
+        )
+    return op(x_q, x_scale, w_q, w_s)
 
 
 def _fp8_linear_pallas_jax(

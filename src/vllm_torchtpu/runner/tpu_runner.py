@@ -5160,6 +5160,14 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        if envs.TPU_FUSED_ADD_RMSNORM and envs.TPU_FUSED_ADD_RMSNORM_QUANT:
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
+
+            n_pairs = arm_prequant(self.model)
+            logger.info(
+                "TPU_FUSED_ADD_RMSNORM_QUANT: paired %d norms with FP8 linears", n_pairs
+            )
+
         # Last: arming needs the drafter's MTP layer and the padding mask.
         if envs.USE_MOE_TP_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.moe_tp_decode import arm

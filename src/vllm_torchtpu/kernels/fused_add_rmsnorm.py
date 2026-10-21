@@ -112,6 +112,91 @@ def fused_add_rms_norm(
     return outs[0]
 
 
+def _quant_kernel(*refs, eps: float, emit_y: bool, q_max: float):
+    """``_kernel`` followed by ``quantize_tensor``'s per-row quant of ``y``."""
+    if emit_y:
+        x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref = refs
+    else:
+        x_ref, r_ref, w_ref, q_ref, s_ref, ro_ref = refs
+        y_ref = None
+    s = x_ref[...].astype(jnp.float32) + r_ref[...].astype(jnp.float32)
+    ro_ref[...] = s.astype(ro_ref.dtype)
+    var = jnp.mean(s * s, axis=-1, keepdims=True)
+    normed = (s * jax.lax.rsqrt(var + eps)).astype(x_ref.dtype)
+    y = (normed.astype(jnp.float32) * w_ref[...].astype(jnp.float32)).astype(
+        x_ref.dtype
+    )
+    if emit_y:
+        y_ref[...] = y
+    # Quantize the bf16-rounded y, as the consumer's quantize_tensor does.
+    yf = y.astype(jnp.float32)
+    amax = jnp.max(jnp.abs(yf), axis=-1, keepdims=True)
+    scale = amax / jnp.float32(q_max)
+    scale = jnp.where(scale == 0, jnp.float32(1.0), scale)
+    s_ref[...] = scale
+    q_ref[...] = jnp.clip(yf / scale, -q_max, q_max).astype(q_ref.dtype)
+
+
+@functools.partial(
+    jax.jit, static_argnames=("eps", "quant_dtype", "emit_y", "block_rows", "interpret")
+)
+def fused_add_rms_norm_quant(
+    x: jax.Array,
+    residual: jax.Array,
+    weight: jax.Array,
+    *,
+    eps: float,
+    quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+    emit_y: bool = True,
+    block_rows: int = DEFAULT_BLOCK_ROWS,
+    interpret: bool = False,
+):
+    """``fused_add_rms_norm`` that also writes the per-row quant of ``y``.
+
+    Returns ``(y, y_q, scale, new_residual)``. ``(y_q, scale)`` equal
+    ``quantize_tensor(y, quant_dtype)`` bit for bit, so an FP8 matmul that reads
+    ``y`` can skip its own amax and convert passes. ``y`` is None unless
+    ``emit_y`` is set, for a second consumer that reads the bf16 output.
+    """
+    rows, hidden = x.shape
+    if rows % block_rows:
+        raise ValueError(f"{rows=} must be a multiple of {block_rows=}")
+    q_max = float(jnp.finfo(quant_dtype).max)
+    row_spec = pl.BlockSpec((block_rows, hidden), lambda i: (i, 0))
+    w_spec = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    s_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
+    out_shape = []
+    out_specs = []
+    if emit_y:
+        out_shape.append(jax.ShapeDtypeStruct((rows, hidden), x.dtype))
+        out_specs.append(row_spec)
+    out_shape += [
+        jax.ShapeDtypeStruct((rows, hidden), quant_dtype),
+        jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+        jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+    ]
+    out_specs += [row_spec, s_spec, row_spec]
+    # fused_add_rms_norm's budget plus two f32 tiles for the quantized outputs.
+    tile = block_rows * hidden * 4
+    vmem_limit = min(100 * 1024 * 1024, max(32 * 1024 * 1024, 14 * tile))
+    outs = pl.pallas_call(
+        functools.partial(_quant_kernel, eps=eps, emit_y=emit_y, q_max=q_max),
+        grid=(rows // block_rows,),
+        in_specs=[row_spec, row_spec, w_spec],
+        out_specs=out_specs,
+        out_shape=out_shape,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=vmem_limit,
+        ),
+        name=f"fused_add_rmsnorm_quant_y{int(emit_y)}_b{block_rows}_h{hidden}",
+        interpret=interpret,
+    )(x, residual, weight.reshape(1, hidden))
+    if emit_y:
+        return outs[0], outs[1], outs[2], outs[3]
+    return None, outs[0], outs[1], outs[2]
+
+
 def reference(x, residual, weight, eps):
     """``vllm.ir.ops`` numerics in JAX (XLA)."""
     orig = x.dtype
