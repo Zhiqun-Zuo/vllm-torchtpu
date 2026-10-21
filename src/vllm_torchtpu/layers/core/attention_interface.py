@@ -1129,7 +1129,8 @@ def sparse_mla_attention_dcp(
     prologue_fault: str | None = None,
     kv_write_fault: str | None = None,
     dcp_rank_ids: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    send_layout: bool = False,
+) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
@@ -1156,6 +1157,14 @@ def sparse_mla_attention_dcp(
       dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
         r = r (`TPU_DCP_RANK_OPERAND`): the shard's rank as data, replacing
         the `all_to_all` of an iota. Same result.
+      send_layout: TPU_DCP_MLA_SEND_LAYOUT, decode buckets with `q_rope_table`
+        and TPU_DCP_MLA_MASK_IN_KERNEL only. The kernel writes the packed merge
+        exchange's send buffer (`sparse_mla_kernel.SEND_PAD_ROWS`), and the op
+        returns `(kv_cache_nope, kv_cache_rope, send)`. `send` is int16
+        `[dcp_size * dcp_size, SEND_PAD_ROWS + num_tokens * num_heads //
+        dcp_size, lkv_dim]`, sharded over `dcp_axis_name`, destination-major
+        per rank. Its sent rows are bit for bit the rows
+        `cp_mla_attention._all_to_all_packed` builds from `(output, lse)`.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1229,6 +1238,17 @@ def sparse_mla_attention_dcp(
         P(dcp_axis_name, None, None),  # partial output
         P(dcp_axis_name, None),  # partial lse
     )
+    if send_layout:
+        if not (q_rope and envs.TPU_DCP_MLA_MASK_IN_KERNEL):
+            raise ValueError(
+                "send_layout requires q_rope_table and TPU_DCP_MLA_MASK_IN_KERNEL=1"
+            )
+        if num_tokens > sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
+            raise ValueError(
+                "send_layout requires at most "
+                f"{sparse_mla_kernel.FUSED_PREP_MAX_TOKENS} tokens, got {num_tokens}"
+            )
+        out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # send
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
@@ -1343,6 +1363,8 @@ def sparse_mla_attention_dcp(
                     lse_in_kernel=mask_in_kernel and decode_bucket,
                     prologue_fault=prologue_fault,
                 )
+                if send_layout:
+                    split_kwargs["send_world"] = dcp_size
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
@@ -1376,6 +1398,21 @@ def sparse_mla_attention_dcp(
             raise ValueError(
                 f"TPU_DCP_MLA_SMALL_CHUNK_TOKENS must be >= 0, got {small_chunk_tokens}"
             )
+        # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
+        # merge's reduce-scatter k waits only for the attention chunks that
+        # produce its rows (mixed buckets with the in-kernel lse mask).
+        merge_pieces = 0
+        if (
+            envs.TPU_DCP_MLA_MERGE_PIECES
+            and not decode_bucket
+            and mask_in_kernel
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
+            and topk_cap
+            and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
+        ):
+            from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
+
+            merge_pieces = _merge_chunks(topk_idx.shape[0])
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1415,12 +1452,15 @@ def sparse_mla_attention_dcp(
                 if topk_cap
                 else ()
             ),
+            out_pieces=merge_pieces,
             **chunk_kwargs,
             **split_kwargs,
         )
         output, lse = attn[:2]
         if kv_write is not None:
             kv_cache_nope, kv_cache_rope = attn[2:]
+        if send_layout:
+            return (kv_cache_nope, kv_cache_rope, lse)  # `lse` is the send buffer
         if not mask_in_kernel:
             assert owns is not None
             lse = jnp.where(owns[:, None], lse, -jnp.inf)

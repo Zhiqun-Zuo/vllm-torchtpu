@@ -267,6 +267,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
+    # Same for the DCP merge's heads-major weighted operand op.
+    "vllm_torchtpu/layers/adapter/dcp_weighted_hm.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",

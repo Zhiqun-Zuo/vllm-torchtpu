@@ -82,6 +82,38 @@ def _build_problem(rng, *, k_scale, query_tokens=128, topk=256, num_heads=8):
     }
 
 
+def _optimized_hlo(fn, *args) -> str:
+    """Post-optimization HLO text of `fn(*args)`.
+
+    `Compiled.as_text()` re-parses the module proto and fails on async ops on
+    this jaxlib, so read the executable's modules directly, else the XLA dump
+    (`--xla_dump_to`).
+    """
+    import glob
+    import os
+
+    compiled = fn.lower(*args).compile()
+    try:
+        return "\n".join(
+            m.to_string() for m in compiled.runtime_executable().hlo_modules()
+        )
+    except Exception:  # noqa: BLE001, S110 - fall back to the dump below
+        pass
+    flags = os.environ.get("XLA_FLAGS", "")
+    dump = next(
+        (f.split("=", 1)[1] for f in flags.split() if f.startswith("--xla_dump_to=")),
+        None,
+    )
+    if dump is None:
+        raise RuntimeError("no HLO text: set XLA_FLAGS=--xla_dump_to=<dir>")
+    files = sorted(
+        glob.glob(os.path.join(dump, "*jit_layers*after_optimizations.txt")),
+        key=os.path.getmtime,
+    )
+    with open(files[-1]) as f:
+        return f.read()
+
+
 class SparseMlaCacheLayoutsTest(parameterized.TestCase):
     @parameterized.product(k_scale=(0.75, 1.0), return_lse=(False, True))
     def test_sparsecore_layout_matches_tensorcore_layout(self, k_scale, return_lse):
@@ -1593,6 +1625,118 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         moved = topk_raw.at[row, 0].set((topk_raw[row, 0] + 1) % 8192)
         bad, _ = jax.block_until_ready(run(moved, mixed_fused_prep=True))
         self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
+
+    def _merge_pieces_run(self, query_tokens, seq_q):
+        """The DCP mixed-bucket config (fused prep, live gather, widths,
+        levers, in-kernel mask) at `query_tokens`; returns (run, counts, real)."""
+        rng = np.random.default_rng(20261012 + query_tokens)
+        problem, _, _, counts, page_table, cu_q_lens, distribution = (
+            self._split_q_lse_case(query_tokens, seq_q, rng)
+        )
+        counts[16:32] = 0
+        live = np.arange(2048)[None, :] < counts[:, None]
+        topk_raw = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+
+        def run(**kw):
+            return sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_raw,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=512,
+                small_chunk_batch_size=4,
+                small_chunk_tokens=32,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                lse_mask_empty=True,
+                mixed_live_gather=True,
+                mixed_live_widths=(256, 384),
+                mixed_body_levers=sparse_mla.MIXED_BODY_DEFAULT,
+                mixed_fused_prep=True,
+                **kw,
+            )
+
+        return run, counts, int(sum(seq_q))
+
+    @parameterized.parameters(
+        # A piece smaller than an attention chunk (128 < 256), one chunk per
+        # piece, and two chunks per piece.
+        {"query_tokens": 1024, "seq_q": (4, 4, 1000)},
+        {"query_tokens": 2048, "seq_q": (4, 4, 2040)},
+        {"query_tokens": 4096, "seq_q": (4, 4, 3500)},
+    )
+    def test_merge_pieces_bit_identical(self, query_tokens, seq_q):
+        """TPU_DCP_MLA_MERGE_PIECES (`out_pieces=8`): every real row's output
+        and every row's lse bit for bit, and the rows past the real tokens
+        weighted 0 by any merge (lse -inf) on both paths."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, real = self._merge_pieces_run(query_tokens, seq_q)
+
+        def bits(x):
+            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
+
+        ref, ref_lse = jax.block_until_ready(run())
+        out, lse = jax.block_until_ready(run(out_pieces=8))
+        self.assertEqual(out.shape, ref.shape)
+        self.assertEqual(lse.shape, ref_lse.shape)
+        np.testing.assert_array_equal(bits(out)[:real], bits(ref)[:real])
+        np.testing.assert_array_equal(
+            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
+        # Every row a merge can weight above 0 (any finite lse) matches bit for
+        # bit, padding rows the grid wrote included; the rest have lse -inf on
+        # both paths, weight 0 in the merge's `where` whatever they hold.
+        weighted = np.isfinite(np.asarray(lse)).any(axis=-1)
+        np.testing.assert_array_equal(bits(out)[weighted], bits(ref)[weighted])
+        self.assertTrue(np.all(np.asarray(lse)[~weighted] == -np.inf))
+        self.assertGreater(int((~weighted).sum()), 0)
+
+    @parameterized.parameters((2048, 1), (4096, 2))
+    def test_merge_pieces_cut_the_dependency(self, query_tokens, calls):
+        """Piece 0 needs only its own attention chunks: with `out_pieces=8`, a
+        program reading rows [0, T/8) keeps `calls` MLA kernel calls. Without
+        pieces it keeps all T/256 of them."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, _, _ = self._merge_pieces_run(query_tokens, (4, 4, query_tokens - 8))
+        rows = query_tokens // 8
+
+        # Named `layers` for `_optimized_hlo`'s XLA-dump fallback glob.
+        def layers(dummy, *, pieces):
+            out, lse = run(out_pieces=pieces)
+            return out[:rows].astype(jnp.float32).sum() + lse[:rows].sum() + dummy
+
+        counts = {}
+        for pieces in (0, 8):
+            fn = jax.jit(functools.partial(layers, pieces=pieces))
+            hlo = _optimized_hlo(fn, jnp.float32(0))
+            counts[pieces] = sum(
+                "custom-call(" in line and "MLA-sparsecore" in line
+                for line in hlo.splitlines()
+            )
+        self.assertEqual(counts[0], query_tokens // 256, counts)
+        self.assertEqual(counts[8], calls, counts)
+
+    def test_merge_pieces_supported(self):
+        ok = sparse_mla.merge_pieces_supported
+        self.assertTrue(ok(4096, 256, 8))
+        self.assertTrue(ok(2048, 256, 8))
+        self.assertTrue(ok(1024, 256, 8))
+        self.assertFalse(ok(256, 256, 8))  # one chunk: nothing to split
+        self.assertFalse(ok(1024, 256, 1))
+        self.assertFalse(ok(3072, 256, 8))  # 384-row pieces straddle chunks
+        self.assertFalse(ok(1000, 256, 8))
 
     @parameterized.parameters((16, 4, 1), (32, 4, 1), (32, 16, 16))
     def test_fused_window_prep_matches_reference(self, num_tokens, bz, atoms):

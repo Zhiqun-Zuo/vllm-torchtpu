@@ -915,6 +915,9 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         # f32 reduce-scatter wire, the reference these checks compare against
         # (#1808 narrows it to bf16 by default; test_rs_out_precision_* below).
         "TPU_DCP_RS_OUT_PRECISION": False,
+        "TPU_DCP_MLA_MERGE_PIECES": 0,
+        "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
+        "TPU_DCP_MERGE_WEIGHTED_HM": False,
     }
     for name, value in {**defaults, **env}.items():
         monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
@@ -1006,6 +1009,106 @@ def test_collapsed_lse_gather_is_bitwise_the_chunked_merge(
     unchunked = _rs_merge_whole(outputs, lses, monkeypatch)
     torch.testing.assert_close(got, unchunked, rtol=0, atol=0)
     assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+@pytest.mark.parametrize("dcp_size", [2, 16])
+def test_head_split_lse_gather_is_bitwise_the_collapsed_gather(dcp_size, monkeypatch):
+    """`TPU_DCP_MLA_MERGE_PIECES=2` gathers chunk 0's lse rows alone and the
+    rest in one call; every row is still gathered exactly once and the merge
+    is the collapsed-gather merge bit for bit."""
+    chunks = 4
+    outputs, lses = _hard_partials(np.random.default_rng(47), dcp_size, tokens=32)
+    on = dict(TPU_DCP_MERGE_CHUNKED=chunks, TPU_DCP_MERGE_CHUNKED_LSE_AG=True)
+    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
+    calls = []
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
+    )
+    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=2, **on)
+    step = 32 // chunks
+    assert sorted(calls) == sorted([step, 32 - step] * dcp_size)
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+    # MERGE_PIECES=1 leaves the merge (and its one gather) alone.
+    calls.clear()
+    one = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MLA_MERGE_PIECES=1, **on)
+    assert calls == [32] * dcp_size
+    torch.testing.assert_close(one, today, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 16])
+@pytest.mark.parametrize("lse_ag", [False, True])
+def test_weighted_heads_major_is_bitwise_the_chunked_merge(
+    dcp_size, lse_ag, monkeypatch
+):
+    """`TPU_DCP_MERGE_WEIGHTED_HM` builds the weighted operand heads-major and
+    reduce-scatters dim 0: the chunked merge bit for bit, per-chunk gathers
+    and the collapsed gather alike. With per-chunk gathers each chunk runs
+    `cp_lse_ag_out_rs`, which already builds its operand heads-major, so
+    WEIGHTED_HM applies to the collapsed gather only."""
+    outputs, lses = _hard_partials(np.random.default_rng(61), dcp_size, tokens=32)
+    on = dict(TPU_DCP_MERGE_CHUNKED=4, TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag)
+    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
+    calls = []
+    real = cp_mla._weighted_reduce_scatter_heads_major
+    monkeypatch.setattr(
+        cp_mla,
+        "_weighted_reduce_scatter_heads_major",
+        lambda o, w, g, *a: calls.append(o.shape[0]) or real(o, w, g, *a),
+    )
+    got = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on
+    )
+    assert calls == ([8] * 4 * dcp_size if lse_ag else [])
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    torch.testing.assert_close(got, today, rtol=0, atol=0)
+    assert _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_reshaped_heads_major_operand_is_caught(monkeypatch):
+    """The check above must fail when the heads-major operand is a reshape of
+    the tokens-major one instead of a transpose."""
+
+    def _reshaped(o, w, g, *a):
+        t, h, d = o.shape
+        w_hm = w.reshape(h, t).unsqueeze(-1)
+        x = o.reshape(h, t, d).to(torch.float32) * w_hm
+        x = torch.where(w_hm > 0, x, torch.zeros_like(x))
+        return g.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(o.dtype)
+
+    monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter_heads_major", _reshaped)
+    outputs, lses = _hard_partials(np.random.default_rng(67), 4, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
+    )
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
+
+
+def test_positive_control_head_split_rest_misaligned_is_caught(monkeypatch):
+    """The check above must fail when the rest gather hands chunks 1.. rows
+    that are not their own (rest rows shifted by one)."""
+    real = cp_mla._gather_lse
+    monkeypatch.setattr(
+        cp_mla,
+        "_gather_lse",
+        lambda x, g: real(x, g) if x.shape[0] == 8 else torch.roll(real(x, g), 1, 1),
+    )
+    outputs, lses = _hard_partials(np.random.default_rng(53), 4, tokens=32)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=4,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+        TPU_DCP_MLA_MERGE_PIECES=2,
+    )
+    assert not _bf16_close(got, _reference_merge(outputs.float(), lses))
 
 
 def test_positive_control_misaligned_collapsed_lse_gather_is_caught(monkeypatch):
@@ -1229,6 +1332,133 @@ def test_bf16_wire_leaves_unchunked_buckets_alone(monkeypatch):
     a = _rs_merge_whole(outputs, lses, monkeypatch)
     b = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_BF16=1)
     torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+# ===================================================================== #
+# The heads-major operand (TPU_DCP_MERGE_WEIGHTED_HM) and the merge pieces'
+# lse split (TPU_DCP_MLA_MERGE_PIECES=2) under the bf16 wire.
+# ===================================================================== #
+
+
+@pytest.mark.parametrize("lse_ag", [False, True])
+@pytest.mark.parametrize("pieces", [0, 2])
+def test_weighted_heads_major_bf16_wire_is_bitwise_the_bf16_wire_merge(
+    lse_ag, pieces, monkeypatch
+):
+    """RS_BF16=1 with the heads-major operand (and the pieces' lse split)
+    rounds the same f32 products once to bf16 and reduce-scatters them in
+    bf16: the RS_BF16=1 merge bit for bit, through the heads-major path."""
+    dcp_size = 16
+    outputs, lses = _spread_partials(
+        np.random.default_rng(113 + dcp_size), dcp_size, 64, 1, 16, 4.0
+    )
+    env = dict(
+        TPU_DCP_MERGE_CHUNKED=8,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=lse_ag,
+        TPU_DCP_MERGE_RS_BF16=1,
+    )
+    want = _rs_merge_whole(outputs, lses, monkeypatch, **env)
+    f32_hm = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
+        **dict(env, TPU_DCP_MERGE_RS_BF16=0),
+    )
+    calls = []
+    real = cp_mla._weighted_reduce_scatter_heads_major
+    monkeypatch.setattr(
+        cp_mla,
+        "_weighted_reduce_scatter_heads_major",
+        lambda o, w, g, *a: calls.append(o.shape[0]) or real(o, w, g, *a),
+    )
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
+        TPU_DCP_MLA_MERGE_PIECES=pieces,
+        **env,
+    )
+    assert calls == [8] * 8 * dcp_size
+    assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert _scale_ulp_errors(got, outputs, lses)["max"] <= _RS_BF16_MAX_ULP[1]
+    # Wiring: the bf16 wire really applies on the heads-major path.
+    assert not torch.equal(got.view(torch.int16), f32_hm.view(torch.int16))
+
+
+def test_weighted_heads_major_leaves_the_bf16_all_to_all_alone(monkeypatch):
+    """RS_BF16=2 (bf16 all-to-all + f32 sum) keeps the tokens-major operand:
+    WEIGHTED_HM is inert there, bit for bit."""
+    outputs, lses = _spread_partials(np.random.default_rng(127), 8, 64, 1, 16, 4.0)
+    env = dict(TPU_DCP_MERGE_CHUNKED=8, TPU_DCP_MERGE_RS_BF16=2)
+    want = _rs_merge_whole(outputs, lses, monkeypatch, **env)
+    calls = []
+    monkeypatch.setattr(
+        cp_mla,
+        "_weighted_reduce_scatter_heads_major",
+        lambda *a: calls.append(1),
+    )
+    got = _rs_merge_whole(
+        outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **env
+    )
+    assert not calls
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_positive_control_bf16_heads_major_wrong_weight_is_caught(monkeypatch):
+    """The bf16 heads-major merge must fail the bound when one rank weighs its
+    partial 25 % too heavily."""
+    real = cp_mla._weighted_reduce_scatter_heads_major
+
+    def wrong(output, weight, group, *a):
+        if group.rank_in_group == 1:
+            weight = weight * 1.25
+        return real(output, weight, group, *a)
+
+    monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter_heads_major", wrong)
+    outputs, lses = _spread_partials(np.random.default_rng(59), 16, 1024, 1, 16, 4.0)
+    got = _rs_merge_whole(
+        outputs,
+        lses,
+        monkeypatch,
+        TPU_DCP_MERGE_CHUNKED=8,
+        TPU_DCP_MERGE_CHUNKED_LSE_AG=True,
+        TPU_DCP_MERGE_RS_BF16=1,
+        TPU_DCP_MERGE_WEIGHTED_HM=True,
+        TPU_DCP_MLA_MERGE_PIECES=2,
+    )
+    assert _scale_ulp_errors(got, outputs, lses)["max"] > _RS_BF16_MAX_ULP[1]
+
+
+@pytest.mark.parametrize("min_tokens,want", [(0, [4, 8, 16]), (8, [8, 16])])
+def test_send_layout_min_tokens_gates_small_buckets(min_tokens, want, monkeypatch):
+    """TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: buckets below it keep the packed
+    a2a merge (send_layout_applies is False); larger ones are unchanged."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    group = type("G", (), {"world_size": 16})()
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(sparse_kernel, "send_layout_supported", lambda *a: True)
+    for name, value in dict(
+        TPU_DCP_MLA_SEND_LAYOUT=True,
+        TPU_DCP_LSE_MERGE_A2A=True,
+        TPU_DCP_LSE_MERGE_A2A_PACK=True,
+        TPU_DCP_LSE_MERGE_A2A_REAL_ROWS=True,
+        TPU_MLA_SPARSE_SPLIT_Q=True,
+        TPU_DCP_MLA_MASK_IN_KERNEL=True,
+        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=64,
+        TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS=min_tokens,
+    ).items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+    got = [
+        t
+        for t in (4, 8, 16)
+        if cp_mla.send_layout_applies(t, 64, 512, torch.bfloat16, True)
+    ]
+    assert got == want
+    assert not cp_mla.send_layout_applies(16, 64, 512, torch.bfloat16, False)
 
 
 # ===================================================================== #

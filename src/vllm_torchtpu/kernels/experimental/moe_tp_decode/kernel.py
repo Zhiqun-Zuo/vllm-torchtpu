@@ -82,6 +82,21 @@ def exact_in_bf16(value: float) -> bool:
     return float(rounded) == float(value)
 
 
+class _Meta:
+    """Indexes three [1] scalar refs (n_valid, rank, e0) as one meta ref."""
+
+    def __init__(self, refs):
+        self.refs = refs
+
+    def __getitem__(self, i):
+        return self.refs[i][0]
+
+
+def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
+    """`_kernel` with the scalar metadata passed as three [1] operands."""
+    return _kernel(_Meta((n_valid_ref, rank_ref, e0_ref)), *refs, **kwargs)
+
+
 def _i_chunk(i):
     """Intermediate columns per ring item for a rank holding I = i."""
     return min(i, _I_CHUNK)
@@ -116,11 +131,15 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
     return need, min(limit, info.vmem_capacity_bytes)
 
 
-def kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts=None) -> str:
+def kernel_name(
+    experts, m, h, i, shared_inter, n_ranks, num_experts=None, split_meta=False
+) -> str:
     name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
         f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
     )
+    if split_meta:
+        name += "-sm"
     if num_experts is not None and num_experts != experts:
         # Expert range: `experts` of the router's num_experts.
         name += f"-ne_{num_experts}"
@@ -502,7 +521,9 @@ def _kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("routed_scale", "topk", "n_ranks"))
+@functools.partial(
+    jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "split_meta")
+)
 def moe_tp_decode(
     x,
     scores,
@@ -522,6 +543,7 @@ def moe_tp_decode(
     routed_scale: float,
     topk: int,
     n_ranks: int,
+    split_meta: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -543,6 +565,8 @@ def moe_tp_decode(
       routed_scale: routed_scaling_factor, exact in bf16.
       topk: experts per token.
       n_ranks: TP ranks.
+      split_meta: pass n_valid, rank and experts_start as three [1] scalar
+        operands (TPU_MOE_TP_DECODE_SPLIT_META).
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -574,18 +598,27 @@ def moe_tp_decode(
     if e_pad != num_experts:
         scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
         bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
-    meta = jnp.stack(
-        [
-            jnp.asarray(n_valid, jnp.int32).reshape(()),
-            jnp.asarray(rank, jnp.int32).reshape(()),
-            jnp.asarray(experts_start, jnp.int32).reshape(()),
-        ]
-    )
+    if split_meta:
+        # As small_all_reduce_valid_rows passes n_valid and rank. A stacked
+        # int32[3] costs XLA one fusion per call.
+        metas = tuple(
+            jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
+        )
+    else:
+        metas = (
+            jnp.stack(
+                [
+                    jnp.asarray(n_valid, jnp.int32).reshape(()),
+                    jnp.asarray(rank, jnp.int32).reshape(()),
+                    jnp.asarray(experts_start, jnp.int32).reshape(()),
+                ]
+            ),
+        )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
         functools.partial(
-            _kernel,
+            _split_entry if split_meta else _kernel,
             local_experts=experts,
             n_chunks=i // ic,
             topk=topk,
@@ -594,7 +627,7 @@ def moe_tp_decode(
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=len(metas),
             in_specs=[vmem, vmem, vmem, *[hbm] * 8],
             out_specs=vmem,
             scratch_shapes=[
@@ -624,9 +657,11 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks, num_experts),
+        name=kernel_name(
+            experts, m, h, i, shared_inter, n_ranks, num_experts, split_meta
+        ),
     )(
-        meta,
+        *metas,
         x,
         scores,
         bias.reshape(1, e_pad),

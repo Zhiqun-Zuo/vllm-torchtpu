@@ -1591,6 +1591,7 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         self.sparse_mla_dcp_rope_op = None
+        self.sparse_mla_dcp_send_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
@@ -1601,6 +1602,16 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.sparse_mla_dcp_rope_op = impl._build_sparse_mla_dcp_op(
                     self, dcp_size, impl.dcp_interleave_size, q_rope=True
                 )
+                # TPU_DCP_MLA_SEND_LAYOUT: the prologue op's decode variant
+                # that writes the packed real-rows merge's send buffer.
+                if envs.TPU_DCP_MLA_SEND_LAYOUT:
+                    self.sparse_mla_dcp_send_op = impl._build_sparse_mla_dcp_op(
+                        self,
+                        dcp_size,
+                        impl.dcp_interleave_size,
+                        q_rope=True,
+                        send_layout=True,
+                    )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention

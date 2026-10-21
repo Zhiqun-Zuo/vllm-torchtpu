@@ -556,3 +556,16 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
     else:
         assert calls == [("chain", tokens)]
         assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
+
+
+def test_shared_meta_reuses_one_experts_start_tensor(monkeypatch):
+    """TPU_MOE_TP_DECODE_SHARED_META: layers with the same experts_start get
+    the same tensor, so XLA can CSE the scalar metadata."""
+    monkeypatch.setattr(moe_tp_decode, "_E0_BUFFERS", {})
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_SHARED_META", True)
+    dev = torch.device("cpu")
+    a, b = moe_tp_decode._e0_tensor(dev, 0), moe_tp_decode._e0_tensor(dev, 0)
+    c = moe_tp_decode._e0_tensor(dev, 64)
+    assert a is b and a is not c and int(c) == 64
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_SHARED_META", False)
+    assert moe_tp_decode._e0_tensor(dev, 0) is not moe_tp_decode._e0_tensor(dev, 0)

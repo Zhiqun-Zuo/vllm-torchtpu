@@ -2002,6 +2002,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS:
                 # Register the merge's ragged exchange op before any trace.
                 _cp_mla_attention.prebuild_ragged_all_to_all(self.dcp_size)
+                if envs.TPU_DCP_MLA_SEND_LAYOUT:
+                    from vllm_torchtpu.kernels.mla.sparse.kernel import (
+                        SEND_PAD_ROWS,
+                    )
+
+                    _cp_mla_attention.prebuild_ragged_all_to_all(
+                        self.dcp_size, SEND_PAD_ROWS - 1
+                    )
+                    if envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK:
+                        _cp_mla_attention.prebuild_send_unpack(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -2230,7 +2240,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         return sparse_mla_impl
 
     def _build_sparse_mla_dcp_op(
-        self, layer: Any, dcp_size: int, interleave_size: int, q_rope: bool = False
+        self,
+        layer: Any,
+        dcp_size: int,
+        interleave_size: int,
+        q_rope: bool = False,
+        send_layout: bool = False,
     ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2243,10 +2258,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         reduction over the DCP group, is done by the torch
         caller (`cp_mla_attention.merge_lse_partials_scatter_heads`), which
         also narrows the head axis back down.
+
+        `send_layout` (TPU_DCP_MLA_SEND_LAYOUT; needs `q_rope`): the op
+        returns `(nope, rope, send)`, the kernel-written int16 send buffer of
+        the packed real-rows merge (`cp_mla_attention.merge_send_layout`),
+        instead of the partial and its lse. Decode buckets only.
         """
+        from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
         from vllm_torchtpu.layers.core.attention_interface import (
             sparse_mla_attention_dcp,
         )
+
+        assert q_rope or not send_layout, "send_layout requires q_rope"
 
         mesh = self._dcp_mesh
         # Set in __init__ when dcp_size > 1, the only case that builds this op.
@@ -2299,6 +2322,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 interleave_size=interleave_size,
                 q_rope_table=rope_table,
                 dcp_rank_ids=rank_ids,
+                send_layout=send_layout,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2439,18 +2463,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             op_name += "_qrope"
         if rank_tensor is not None:
             op_name += "_rank"
+        if send_layout:
+            op_name += "_send"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
         if rank_tensor is not None:
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # rank ids, sharded
+        output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
+        if send_layout:
+            # Caches, then this rank's [dcp, rows, V] send blocks. The torch
+            # op's schema is inferred from the return annotation too: three
+            # outputs, not the partial + lse pair's four.
+            output_specs = output_specs[:2] + (P(DCP_AXIS_NAME),)
+            core_fn.__annotations__ = {
+                **core_fn.__annotations__,
+                "return": tuple[jax.Array, jax.Array, jax.Array],
+            }
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
             core_fn,
             donate_argnums=(0, 1),
             mesh=mesh,
             input_partition_specs=input_specs,
-            output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
+            output_partition_specs=output_specs,
         )
 
         # We must overwrite the default fake implementation as vLLM uses
@@ -2459,6 +2495,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
         ):
             del rest, kwargs
+            if send_layout:
+                tokens, heads, vdim = ql_nope.shape
+                return (
+                    torch.empty_like(kv_cache_nope),
+                    torch.empty_like(kv_cache_rope),
+                    ql_nope.new_empty(
+                        (
+                            dcp_size,
+                            sparse_mla_kernel.SEND_PAD_ROWS
+                            + tokens * (heads // dcp_size),
+                            vdim,
+                        ),
+                        dtype=torch.int16,
+                    ),
+                )
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
@@ -2481,10 +2532,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             *rope_table: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> Any:
             assert len(rope_table) == int(q_rope), "rope table iff q_rope"
             nope_cache, rope_cache = kv_cache
-            new_nope, new_rope, outputs, lse = sparse_mla_jax_op(
+            results = sparse_mla_jax_op(
                 nope_cache,
                 rope_cache,
                 ql_nope,
@@ -2499,8 +2550,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 *rope_table,
                 *(() if rank_tensor is None else (rank_tensor,)),
             )
+            new_nope, new_rope = results[:2]
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
+            if send_layout:
+                return results[2]  # the send buffer
+            outputs, lse = results[2:]
             return outputs, lse
 
         return sparse_mla_dcp_impl
@@ -2637,55 +2692,89 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
-                dcp_op = layer.sparse_mla_dcp_op
-                if q_rope_table:
-                    # TPU_MLA_DECODE_PROLOGUE: raw q head + rope table.
-                    dcp_op = layer.sparse_mla_dcp_rope_op
-                    assert dcp_op is not None, (
-                        "TPU_MLA_DECODE_PROLOGUE rope op was never built"
-                    )
-                partial, lse = dcp_op(
-                    kv_cache,
-                    ql_nope_dcp,
-                    q_pe_dcp,
-                    kv_c_normed_flat,
-                    k_pe_flat,
-                    topk_indices,
-                    attn_metadata.seq_lens,
-                    attn_metadata.block_tables,
-                    attn_metadata.query_start_loc,
-                    attn_metadata.request_distribution,
-                    *q_rope_table,
-                )
-                # The scatter undoes the head all-gather above.
-                #
-                # Only the backbone may use the all-to-all merge. The merge
-                # picks it by comparing the token count to
-                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
-                # the backbone is traced multiple times, once per bucket
-                # group (`_precompile_backbone`). The MTP drafter (model_tag
-                # "eagle_head") is traced once for every bucket: the
-                # comparison would pin its graph to the first size, and the
-                # large buckets fail with ShapeSpecializationError. So the
-                # drafter keeps the reduce-scatter, as with the flag off.
                 is_backbone = vllm_compilation_backends.model_tag == "backbone"
-                wire_dtype = partial.dtype
-                if uv_first:
-                    # A narrowed merge rounds to the wire dtype anyway.
-                    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
-                    partial = project_uv_heads(
-                        partial,
-                        layer.W_UV_dcp_qrep,
-                        layer.W_UV_dcp_qrep_scale,
-                        out_dtype=wire_dtype if narrow else torch.float32,
+                send_op = getattr(layer, "sparse_mla_dcp_send_op", None)
+                if (
+                    q_rope_table
+                    and send_op is not None
+                    # The send buffer carries the latent partial; W_UV before
+                    # the merge (uv_first) needs the projected one.
+                    and not uv_first
+                    and _cp_mla_attention.send_layout_applies(
+                        ql_nope_dcp.shape[0],
+                        ql_nope_dcp.shape[1],
+                        ql_nope_dcp.shape[2],
+                        ql_nope_dcp.dtype,
+                        is_backbone,
                     )
-                outputs = merge_lse_partials_scatter_heads(
-                    partial,
-                    lse,
-                    is_backbone=is_backbone,
-                    wire_dtype=wire_dtype,
-                    query_start_loc=attn_metadata.query_start_loc,
-                )
+                ):
+                    # TPU_DCP_MLA_SEND_LAYOUT: the kernel writes the packed
+                    # real-rows exchange's send buffer; one ragged a2a + merge.
+                    send = send_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                        *q_rope_table,
+                    )
+                    outputs = _cp_mla_attention.merge_send_layout(
+                        send, attn_metadata.query_start_loc, ql_nope_dcp.shape[0]
+                    )
+                else:
+                    dcp_op = layer.sparse_mla_dcp_op
+                    if q_rope_table:
+                        # TPU_MLA_DECODE_PROLOGUE: raw q head + rope table.
+                        dcp_op = layer.sparse_mla_dcp_rope_op
+                        assert dcp_op is not None, (
+                            "TPU_MLA_DECODE_PROLOGUE rope op was never built"
+                        )
+                    partial, lse = dcp_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                        *q_rope_table,
+                    )
+                    # The scatter undoes the head all-gather above.
+                    #
+                    # Only the backbone may use the all-to-all merge. The merge
+                    # picks it by comparing the token count to
+                    # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                    # the backbone is traced multiple times, once per bucket
+                    # group (`_precompile_backbone`). The MTP drafter (model_tag
+                    # "eagle_head") is traced once for every bucket: the
+                    # comparison would pin its graph to the first size, and the
+                    # large buckets fail with ShapeSpecializationError. So the
+                    # drafter keeps the reduce-scatter, as with the flag off.
+                    wire_dtype = partial.dtype
+                    if uv_first:
+                        # A narrowed merge rounds to the wire dtype anyway.
+                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                        partial = project_uv_heads(
+                            partial,
+                            layer.W_UV_dcp_qrep,
+                            layer.W_UV_dcp_qrep_scale,
+                            out_dtype=wire_dtype if narrow else torch.float32,
+                        )
+                    outputs = merge_lse_partials_scatter_heads(
+                        partial,
+                        lse,
+                        is_backbone=is_backbone,
+                        wire_dtype=wire_dtype,
+                        query_start_loc=attn_metadata.query_start_loc,
+                    )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
