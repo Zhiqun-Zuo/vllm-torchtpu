@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_WEIGHTED_HM: bool = False
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_VSPACE: bool = False
+    TPU_DCP_MERGE_VSPACE_MIN_TOKENS: int = 1024
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
@@ -573,6 +575,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # build the same operand with XLA ops.
     "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", 0
+    ),
+    # Apply W_UV for every DCP head before the chunked merge's reduce-scatter,
+    # which then carries v_head_dim instead of kv_lora_rank columns. Not bitwise.
+    # Replicates W_UV per rank; off under TPU_DCP_MERGE_RS_BF16=2.
+    "TPU_DCP_MERGE_VSPACE": env_bool("TPU_DCP_MERGE_VSPACE", default=False),
+    # TPU_DCP_MERGE_VSPACE only for buckets of at least this many tokens. A
+    # value above TPU_DCP_MERGE_CHUNKED_MIN_TOKENS adds a trace-time token-count
+    # guard on the backbone.
+    "TPU_DCP_MERGE_VSPACE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MERGE_VSPACE_MIN_TOKENS", 1024
     ),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend

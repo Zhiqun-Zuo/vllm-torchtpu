@@ -72,3 +72,84 @@ def weighted_heads_major(
     `bf16` (TPU_DCP_MERGE_RS_BF16): the same values rounded once to bf16."""
     op = _op_bf16 if bf16 else _op
     return op(output.contiguous(), weight.to(torch.float32).contiguous())
+
+
+def _register_vspace(bf16: bool, scaled: bool):
+    out_dtype = jnp.bfloat16 if bf16 else jnp.float32
+    t_dtype = torch.bfloat16 if bf16 else torch.float32
+
+    if scaled:
+
+        def fn(
+            o: jax.Array, w: jax.Array, w_uv: jax.Array, scale: jax.Array
+        ) -> jax.Array:
+            return _k.vspace_weighted_heads_major(
+                o, w, w_uv, scale, out_dtype=out_dtype
+            )
+
+        def fake(o, w, w_uv, scale):
+            t, h, _ = o.shape
+            return torch.empty((h, t, w_uv.shape[-1]), dtype=t_dtype, device=o.device)
+
+    else:
+
+        def fn(o: jax.Array, w: jax.Array, w_uv: jax.Array) -> jax.Array:
+            return _k.vspace_weighted_heads_major(o, w, w_uv, None, out_dtype=out_dtype)
+
+        def fake(o, w, w_uv):
+            t, h, _ = o.shape
+            return torch.empty((h, t, w_uv.shape[-1]), dtype=t_dtype, device=o.device)
+
+    name = "pallas::dcp_vspace_weighted_hm" + ("_bf16" if bf16 else "_f32")
+    op = pallas.jax_op(name + ("_scaled" if scaled else ""), fn)
+    op.register_fake(fake)
+    return op
+
+
+# The V-space operand (TPU_DCP_MERGE_VSPACE): one op per (bf16 output, scaled
+# W_UV), all registered at import, never inside a trace.
+_VSPACE_OPS = {
+    (bf16, scaled): _register_vspace(bf16, scaled)
+    for bf16 in (True, False)
+    for scaled in (False, True)
+}
+
+
+def vspace_weighted_heads_major(
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None = None,
+    bf16: bool = True,
+) -> torch.Tensor:
+    """[T, H, C], f32[T, H], W_UV [H, C, V] (+ scale) -> [H, T, V] =
+    where(w > 0, (o_h @ W_UV_h) * w, 0), heads-major, in bf16 (`bf16`,
+    TPU_DCP_MERGE_RS_BF16=1) or f32."""
+    args = [
+        output.contiguous(),
+        weight.to(torch.float32).contiguous(),
+        w_uv.contiguous(),
+    ]
+    if w_uv_scale is not None:
+        args.append(w_uv_scale.contiguous())
+    return _VSPACE_OPS[(bf16, w_uv_scale is not None)](*args)
+
+
+def _keep_fn(a: jax.Array, b: jax.Array) -> jax.Array:
+    del b
+    return a
+
+
+def _keep_fake(a: torch.Tensor, b: torch.Tensor):
+    return torch.empty_like(a)
+
+
+_keep_op = pallas.jax_op("pallas::dcp_keep_input", _keep_fn)
+_keep_op.register_fake(_keep_fake)
+
+
+def keep_input(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a` unchanged; `b` becomes an input of the traced graph without any
+    computation on it (the exported function ignores it, so XLA drops the
+    use: no copy, no op). For graphs that must lift the same buffers."""
+    return _keep_op(a.contiguous(), b)

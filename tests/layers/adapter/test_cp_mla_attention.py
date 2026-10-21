@@ -1295,7 +1295,7 @@ def test_positive_control_wrong_weight_exceeds_the_bf16_bound(
     heavily (its own lse raised by log 1.25, the merged lse left alone)."""
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses, group, rs_dtype=None):
+    def wrong(output, lse_f32, lses, group, rs_dtype=None, vspace=None):
         if group.rank_in_group == 1:
             lse_f32 = lse_f32 + math.log(1.25)
         return real(output, lse_f32, lses, group)
@@ -1803,3 +1803,74 @@ def test_rs_out_precision_chunked_merge_is_bitwise_the_unchunked_merge(
         # wire). Two ranks' terms round to the same bits on this data.
         f32 = _rs_merge_whole(outputs, lses, monkeypatch)
         assert not torch.equal(today.view(torch.int16), f32.view(torch.int16))
+
+
+def _vspace_gate_env(monkeypatch, **overrides):
+    env = {
+        "TPU_DCP_MERGE_VSPACE": True,
+        "TPU_DCP_MERGE_VSPACE_MIN_TOKENS": 1024,
+        "TPU_DCP_LSE_MERGE_A2A": True,
+        "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": 64,
+        "TPU_DCP_MERGE_CHUNKED": 8,
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": 1024,
+        "TPU_DCP_MERGE_RS_BF16": 1,
+        **overrides,
+    }
+    for name, value in env.items():
+        monkeypatch.setattr(cp_mla.envs, name, value, raising=False)
+    group = _FakeGroup(torch.zeros(8, 1, 8, 1), torch.zeros(8, 1, 8), 0)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+
+
+@pytest.mark.parametrize(
+    "tokens,is_backbone,expect",
+    [
+        (64, True, False),  # all-to-all merge
+        (512, True, False),  # below the chunk gate
+        (1024, True, True),
+        (1032, True, False),  # not a multiple of 8 * chunks: unchunked
+        (2048, False, False),  # the MTP drafter
+    ],
+)
+def test_vspace_merge_takes_the_backbone_chunked_buckets(
+    tokens, is_backbone, expect, monkeypatch
+):
+    _vspace_gate_env(monkeypatch)
+    assert cp_mla.vspace_merge_applies(tokens, is_backbone) is expect
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"TPU_DCP_MERGE_VSPACE": False}, {"TPU_DCP_MERGE_RS_BF16": 2}],
+)
+def test_vspace_merge_is_off_without_the_flag_or_under_rs_bf16_all_to_all(
+    overrides, monkeypatch
+):
+    _vspace_gate_env(monkeypatch, **overrides)
+    assert not cp_mla.vspace_merge_applies(4096, True)
+
+
+def test_vspace_merge_is_off_without_a_group(monkeypatch):
+    _vspace_gate_env(monkeypatch)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
+    assert not cp_mla.vspace_merge_applies(4096, True)
+
+
+def test_vspace_min_tokens_above_the_chunk_gate(monkeypatch):
+    _vspace_gate_env(monkeypatch, TPU_DCP_MERGE_VSPACE_MIN_TOKENS=2048)
+    assert not cp_mla.vspace_merge_applies(1024, True)
+    assert cp_mla.vspace_merge_applies(2048, True)
+
+
+def test_vspace_merge_never_compares_the_drafter_token_count(monkeypatch):
+    """A comparison on the drafter's token count would specialize its single
+    graph to the first bucket (ShapeSpecializationError)."""
+
+    class _Symbolic(int):
+        def __lt__(self, other):
+            raise AssertionError("compared")
+
+        __le__ = __gt__ = __ge__ = __mod__ = __lt__
+
+    _vspace_gate_env(monkeypatch)
+    assert not cp_mla.vspace_merge_applies(_Symbolic(4096), False)

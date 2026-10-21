@@ -112,3 +112,39 @@ def weighted_heads_major_xla(
     x = o.astype(jnp.float32) * w
     x = jnp.where(w > 0, x, jnp.zeros_like(x)).astype(out_dtype)
     return jnp.transpose(x, (1, 0, 2))
+
+
+@functools.partial(jax.jit, static_argnames=("out_dtype",))
+def vspace_weighted_heads_major(
+    o: jax.Array,
+    w: jax.Array,
+    w_uv: jax.Array,
+    w_uv_scale: jax.Array | None = None,
+    out_dtype=jnp.bfloat16,
+) -> jax.Array:
+    """`o` [T, H, C] (bf16), `w` f32[T, H], `w_uv` [H, C, V] with an optional
+    per-channel scale [H, 1, V] -> [H, T, V] =
+    `where(w > 0, (o_h @ W_UV_h) * w, 0)`, heads-major (TPU_DCP_MERGE_VSPACE).
+
+    `w_uv` holds W_UV for the same H heads as `o`, in the same order. The
+    projection takes bf16 operands and accumulates in f32, and the weight
+    multiplies the f32 product, so the cast to `out_dtype` is the only
+    rounding before the collective.
+    """
+    out_dtype = jnp.dtype(out_dtype)
+    t, h, c = o.shape
+    if w.shape != (t, h):
+        raise ValueError(f"w {w.shape} must be [{t}, {h}]")
+    if w_uv.shape[:2] != (h, c):
+        raise ValueError(f"w_uv {w_uv.shape} must be [{h}, {c}, V]")
+    v = jax.lax.dot_general(
+        o,
+        w_uv.astype(o.dtype),
+        (((2,), (1,)), ((1,), (0,))),
+        preferred_element_type=jnp.float32,
+    )  # [H, T, V]
+    if w_uv_scale is not None:
+        v = v * w_uv_scale.astype(jnp.float32).reshape(h, 1, -1)
+    wt = jnp.transpose(w.astype(jnp.float32), (1, 0))[:, :, None]  # [H, T, 1]
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    return jnp.where(wt > 0, v * wt, jnp.zeros_like(v)).astype(out_dtype)

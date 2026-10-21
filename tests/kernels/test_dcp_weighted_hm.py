@@ -119,3 +119,93 @@ def test_weighted_hm_min_tokens_dispatch(monkeypatch, min_tokens, chunks, rows, 
         jnp.zeros((rows, 64, 512), jnp.bfloat16), jnp.zeros((rows, 64)), jnp.bfloat16
     )
     assert calls == ["kernel" if kernel else "xla"]
+
+
+def _vspace_case(t, h=64, c=512, v=256, seed=0):
+    rng = np.random.default_rng(seed)
+    w = rng.random((t, h)).astype(np.float32)
+    w[rng.random((t, h)) < 0.1] = 0.0
+    o = rng.standard_normal((t, h, c)).astype(np.float32)
+    o[w == 0.0] = np.nan  # a zero-weight partial may be NaN
+    w_uv = rng.standard_normal((h, c, v)) / np.sqrt(c)
+    return (
+        jnp.asarray(o, jnp.bfloat16),
+        jnp.asarray(w),
+        jnp.asarray(w_uv, jnp.bfloat16),
+    )
+
+
+def _vspace_reference(o, w, w_uv, scale=None):
+    o = np.nan_to_num(np.asarray(o.astype(jnp.float32), np.float64))
+    v = np.matmul(
+        o.transpose(1, 0, 2), np.asarray(w_uv.astype(jnp.float32), np.float64)
+    )
+    if scale is not None:
+        v = v * np.asarray(scale, np.float64)
+    w = np.asarray(w, np.float64).T[:, :, None]
+    return np.where(w > 0, v * w, 0.0)
+
+
+def _max_rel_err(got, want):
+    got = np.asarray(jnp.asarray(got, jnp.float32), np.float64)
+    return float(np.abs(got - want).max() / np.abs(want).max())
+
+
+def test_vspace_weighted_heads_major_matches_f64():
+    o, w, w_uv = _vspace_case(256)
+    got = dcp_weighted_hm.vspace_weighted_heads_major(o, w, w_uv, out_dtype=jnp.float32)
+    assert got.shape == (64, 256, 256)
+    assert bool(jnp.isfinite(got).all())
+    assert _max_rel_err(got, _vspace_reference(o, w, w_uv)) < 1e-5
+
+
+def test_vspace_weighted_heads_major_applies_the_scale():
+    o, w, w_uv = _vspace_case(128, seed=1)
+    scale = np.random.default_rng(3).random((64, 1, 256)).astype(np.float32) + 0.5
+    got = dcp_weighted_hm.vspace_weighted_heads_major(
+        o, w, w_uv, jnp.asarray(scale), out_dtype=jnp.float32
+    )
+    assert _max_rel_err(got, _vspace_reference(o, w, w_uv, scale)) < 1e-5
+
+
+def test_vspace_weighted_heads_major_bf16_is_f32_rounded_once():
+    o, w, w_uv = _vspace_case(128, seed=2)
+    f32 = dcp_weighted_hm.vspace_weighted_heads_major(o, w, w_uv, out_dtype=jnp.float32)
+    bf16 = dcp_weighted_hm.vspace_weighted_heads_major(
+        o, w, w_uv, out_dtype=jnp.bfloat16
+    )
+    assert bf16.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(
+        np.asarray(bf16).view(np.uint16),
+        np.asarray(f32.astype(jnp.bfloat16)).view(np.uint16),
+    )
+
+
+def test_vspace_torch_op_compiled_matches_jax():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_tpu")
+    from torch_tpu._internal import compile as tpu_compile
+
+    from vllm_torchtpu.layers.adapter import dcp_weighted_hm as adapter
+
+    o, w, w_uv = _vspace_case(256, seed=4)
+    want = dcp_weighted_hm.vspace_weighted_heads_major(
+        o, w, w_uv, out_dtype=jnp.bfloat16
+    )
+
+    def to_torch(x):
+        dtype = torch.bfloat16 if x.dtype == jnp.bfloat16 else torch.float32
+        return torch.from_numpy(np.asarray(x.astype(jnp.float32))).to(dtype).to("tpu")
+
+    torch._dynamo.reset()
+    fn = torch.compile(
+        adapter.vspace_weighted_heads_major,
+        fullgraph=True,
+        dynamic=False,
+        backend=tpu_compile.TpuBackend(),
+    )
+    got = fn(to_torch(o), to_torch(w), to_torch(w_uv)).cpu()
+    assert tuple(got.shape) == (64, 256, 256) and got.dtype == torch.bfloat16
+    np.testing.assert_array_equal(
+        got.view(torch.int16).numpy(), np.asarray(want).view(np.int16)
+    )

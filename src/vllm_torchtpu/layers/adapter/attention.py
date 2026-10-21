@@ -111,6 +111,29 @@ def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
 _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
 
+
+def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tensor:
+    """`out` unchanged, with each buffer lifted into the trace during the
+    backbone warmup.
+
+    The warmup shares a token bucket between the two traces of a token-count
+    branch only if both lift the same buffers (`shape_variants`). Under
+    TPU_DCP_MERGE_VSPACE one side reads the DCP-gathered W_UV and the other
+    the local W_UV, so each side also lifts the other's. `keep_input` reads
+    no data, so the program is unchanged.
+    """
+    from vllm_torchtpu.compilation import shape_variants
+
+    if not shape_variants.in_warmup() or out.device.type != "tpu":
+        return out
+    from vllm_torchtpu.layers.adapter.dcp_weighted_hm import keep_input
+
+    for buf in bufs:
+        if buf is not None:
+            out = keep_input(out, buf)
+    return out
+
+
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
 
@@ -2595,6 +2618,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # Whether the DCP merge already applied W_UV (TPU_DCP_MERGE_VSPACE).
+        projected = False
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2758,23 +2783,44 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # comparison would pin its graph to the first size, and the
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
-                    wire_dtype = partial.dtype
-                    if uv_first:
-                        # A narrowed merge rounds to the wire dtype anyway.
-                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
-                        partial = project_uv_heads(
-                            partial,
-                            layer.W_UV_dcp_qrep,
-                            layer.W_UV_dcp_qrep_scale,
-                            out_dtype=wire_dtype if narrow else torch.float32,
+                    w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
+                    if w_uv_vspace is not None and use_qrep and not uv_first:
+                        # The decode buckets' trace lifts the local W_UV.
+                        w_uv_vspace = _retain_buffers(
+                            w_uv_vspace,
+                            layer.W_UV,
+                            getattr(layer, "W_UV_scale", None),
                         )
-                    outputs = merge_lse_partials_scatter_heads(
-                        partial,
-                        lse,
-                        is_backbone=is_backbone,
-                        wire_dtype=wire_dtype,
-                        query_start_loc=attn_metadata.query_start_loc,
-                    )
+                        # TPU_DCP_MERGE_VSPACE: chunked buckets merge in V
+                        # space and come back through W_UV already.
+                        outputs, projected = (
+                            _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
+                                partial,
+                                lse,
+                                w_uv_vspace,
+                                getattr(layer, "W_UV_dcp_vspace_scale", None),
+                                is_backbone=is_backbone,
+                                query_start_loc=attn_metadata.query_start_loc,
+                            )
+                        )
+                    else:
+                        wire_dtype = partial.dtype
+                        if uv_first:
+                            # A narrowed merge rounds to the wire dtype anyway.
+                            narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                            partial = project_uv_heads(
+                                partial,
+                                layer.W_UV_dcp_qrep,
+                                layer.W_UV_dcp_qrep_scale,
+                                out_dtype=wire_dtype if narrow else torch.float32,
+                            )
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=is_backbone,
+                            wire_dtype=wire_dtype,
+                            query_start_loc=attn_metadata.query_start_loc,
+                        )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2811,7 +2857,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        if uv_first:
+        if uv_first or projected:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
@@ -2819,10 +2865,17 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank
             ).transpose(0, 1)
+            w_uv_src = layer.W_UV
+            vspace_w = getattr(layer, "W_UV_dcp_vspace", None)
+            if vspace_w is not None:
+                # The chunked buckets' trace lifts the gathered W_UV.
+                w_uv_src = _retain_buffers(
+                    w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+                )
             w_uv = (
-                layer.W_UV.to(outputs_t.dtype)
-                if layer.W_UV.dtype != outputs_t.dtype
-                else layer.W_UV
+                w_uv_src.to(outputs_t.dtype)
+                if w_uv_src.dtype != outputs_t.dtype
+                else w_uv_src
             )
             out_proj = torch.bmm(outputs_t, w_uv)
             if hasattr(layer, "W_UV_scale"):
