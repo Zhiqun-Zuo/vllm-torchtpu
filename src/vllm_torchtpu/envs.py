@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = False
+    FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
@@ -887,6 +888,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the GMM MoE path, in the same exported program. EP layers keep the GMM
     # path for now.
     "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL"),
+    # Smallest step, in tokens, that the moe_tp_decode op of a TP-expert layer
+    # runs through the fused MoE prefill kernel. Needs FUSED_MOE_PREFILL_KERNEL=1
+    # and USE_MOE_TP_DECODE_KERNEL=1.
+    "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
+        "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
+    ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),

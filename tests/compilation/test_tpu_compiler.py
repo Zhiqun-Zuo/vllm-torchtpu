@@ -317,6 +317,94 @@ class TestTpuCompilerCache:
             )
             assert self._sc_offload_flags() == expected
 
+    @pytest.mark.parametrize(
+        "kernel,extra_env,all_reduce,all_gather",
+        [
+            # The chip-family default: lowered for all-reduces with the kernel on.
+            ("1", {}, 1 << 20, 64 << 20),
+            ("0", {}, 64 << 20, 64 << 20),
+            # An explicit value is kept as given, also above 1 MiB.
+            (
+                "1",
+                {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(8 << 20)},
+                8 << 20,
+                8 << 20,
+            ),
+        ],
+    )
+    def test_env_override_sc_all_reduce_floor_with_prefill_kernel(
+        self, kernel, extra_env, all_reduce, all_gather
+    ):
+        """With the fused MoE prefill kernel on, the chip-family all-reduce
+        threshold is lowered to 1 MiB; explicit values are kept; all-gathers
+        keep their threshold."""
+        env_mock = {
+            "FUSED_MOE_PREFILL_KERNEL": kernel,
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            expected = [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes={n}"
+                for op, n in (("all_reduce", all_reduce), ("all_gather", all_gather))
+            ]
+            assert self._sc_offload_flags() == expected
+
+    def test_env_override_user_all_reduce_flag_wins_with_prefill_kernel(self):
+        """An all-reduce flag in LIBTPU_INIT_ARGS is kept as given."""
+        env_mock = {
+            "FUSED_MOE_PREFILL_KERNEL": "1",
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            "LIBTPU_INIT_ARGS": (
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=4096"
+            ),
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert self._sc_offload_flags() == [
+                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes="
+                f"{64 << 20}",
+                "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=4096",
+            ]
+
+    @pytest.mark.parametrize(
+        "extra_env,warns",
+        [
+            ({}, False),
+            ({"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": str(8 << 20)}, True),
+        ],
+    )
+    def test_env_override_warns_on_high_all_reduce_floor_with_prefill_kernel(
+        self, caplog, extra_env, warns
+    ):
+        """With the kernel on, a floor above 1 MiB logs one warning."""
+        env_mock = {
+            "FUSED_MOE_PREFILL_KERNEL": "1",
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with (
+            patch.dict(os.environ, env_mock, clear=True),
+            caplog.at_level("WARNING", logger="vllm_torchtpu.env_override"),
+        ):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if "FUSED_MOE_PREFILL_KERNEL is on" in r.getMessage()
+        ]
+        assert len(messages) == (1 if warns else 0)
+
     @pytest.mark.parametrize("value", ["banana", "-1"])
     def test_env_override_sc_offload_bad_value_raises(self, value):
         """A value that is not "auto" or a non-negative integer stops the

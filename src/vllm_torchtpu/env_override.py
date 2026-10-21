@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
 
+import logging
 import os
 
 # envs.py imports nothing from this package, so it is safe to load here,
@@ -184,13 +185,48 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
+# With FUSED_MOE_PREFILL_KERNEL on and its all-reduces on the TensorCore,
+# GLM-5.2 MTP draft acceptance drops; the cause is not identified. While the
+# kernel is on, the chip-family all-reduce threshold is lowered to 1 MiB.
+# Explicit values and flags are kept as given.
+_PREFILL_KERNEL_ALL_REDUCE_BYTES = 1 << 20
+_SC_ALL_REDUCE_FLAG = "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes"
 if _sc_offload_bytes is not None:
     for _flag_name in (
-        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+        _SC_ALL_REDUCE_FLAG,
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
     ):
+        _bytes = _sc_offload_bytes
+        if (
+            _flag_name == _SC_ALL_REDUCE_FLAG
+            and envs.FUSED_MOE_PREFILL_KERNEL
+            and envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
+        ):
+            _bytes = min(_bytes, _PREFILL_KERNEL_ALL_REDUCE_BYTES)
         if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+            _libtpu_extra_args.append(f"{_flag_name}={_bytes}")
+
+if envs.FUSED_MOE_PREFILL_KERNEL:
+    _all_reduce_floor = next(
+        (
+            token.split("=", 1)[1]
+            for token in [*_libtpu_extra_args, *_existing_libtpu_args.split()]
+            if token.startswith(_SC_ALL_REDUCE_FLAG + "=")
+        ),
+        None,
+    )
+    if (
+        _all_reduce_floor is None
+        or not _all_reduce_floor.isdigit()
+        or int(_all_reduce_floor) > _PREFILL_KERNEL_ALL_REDUCE_BYTES
+    ):
+        logging.getLogger(__name__).warning(
+            "FUSED_MOE_PREFILL_KERNEL is on but the SparseCore all-reduce "
+            "offload floor is %s; it must be at most %d bytes, or GLM-5.2 MTP "
+            "draft acceptance can drop.",
+            _all_reduce_floor or "libtpu's default",
+            _PREFILL_KERNEL_ALL_REDUCE_BYTES,
+        )
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)

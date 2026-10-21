@@ -484,7 +484,7 @@ def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_
 @pytest.mark.parametrize(
     ("prefill", "spec", "want"),
     [
-        (True, {}, 256),  # TP experts: steps above the cap take the prefill kernel
+        (True, {}, 256),  # TP experts: steps from MIN_TOKENS take the prefill kernel
         (False, {}, None),
         (True, {"use_ep": True, "ep_size": 4, "tp_size": 4, "ep_rank": 1}, None),
     ],
@@ -493,15 +493,15 @@ def test_prefill_kernel_arms_on_tp_experts_only(
     harness, monkeypatch, prefill, spec, want
 ):
     monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL", prefill)
-    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256)
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256)
     assert moe_tp_decode.arm(harness.model(spec)) == 1
-    assert harness.statics[0].prefill_above == want
+    assert harness.statics[0].prefill_min_tokens == want
 
 
 @pytest.mark.parametrize(
-    ("tokens", "prefill"), [(512, True), (256, False), (128, False)]
+    ("tokens", "prefill"), [(512, True), (256, True), (128, False)]
 )
-def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, prefill):
+def test_op_body_runs_the_prefill_kernel_from_min_tokens(monkeypatch, tokens, prefill):
     import jax
     import jax.numpy as jnp
 
@@ -526,7 +526,7 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
         activation="silu",
         use_sparse_core=False,
         onehot_threshold=0,
-        prefill_above=256,
+        prefill_min_tokens=256,
     )
     body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
     f32, f8 = jnp.float32, jnp.float8_e4m3fn

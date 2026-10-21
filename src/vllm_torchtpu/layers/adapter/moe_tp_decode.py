@@ -32,10 +32,10 @@ grouped GEMMs, ragged gather-reduce) plus the shared expert and a psum, so
 prefill and mixed batches keep the EP x TP routed kernels.
 
 Prefill kernel: with FUSED_MOE_PREFILL_KERNEL=1, a TP-expert layer (no EP)
-runs the steps of more than FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens through
-kernels/experimental/fused_moe_prefill (routed and shared experts, combine and
-all-reduce) instead of the usual path and a psum: the same kernel and the same
-cut-over as under FUSED_MOE_DECODE_KERNEL, which this op stands down for.
+runs the steps of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS tokens through
+the fused MoE prefill kernel (layers/adapter/fused_moe_prefill.py: routed and
+shared experts, combine and all-reduce) in the same exported program instead
+of the usual path and a psum.
 """
 
 import dataclasses
@@ -53,14 +53,22 @@ from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
+from vllm_torchtpu.distributed.ep_mesh import (
+    EP_AXIS_NAME,
+    build_ep_mesh,
+    ep_mesh_index,
+    get_ep_group,
+)
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import fused_moe_prefill
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter.fused_moe_prefill import (
+    prefill_layer,
+    prefill_min_tokens,
+)
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -116,9 +124,9 @@ class _OpStatics:
     # TPU_MOE_ROUTER_TOPK_BIAS: the psum path picks experts as the layer does
     # (router_topk.select_bias; same ids and weights as select on scores+bias).
     router_bias: bool = False
-    # FUSED_MOE_PREFILL_KERNEL on a TP-expert layer: token counts above this
-    # run the fused MoE prefill kernel instead of the psum path. None = off.
-    prefill_above: int | None = None
+    # FUSED_MOE_PREFILL_KERNEL on a TP-expert layer: token counts of at least
+    # this run the fused MoE prefill kernel instead of the psum path. None = off.
+    prefill_min_tokens: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,11 +335,10 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         onehot_threshold=resolve_onehot_permute_threshold(),
         use_ep=bool(par.use_ep),
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
-        prefill_above=(
-            envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
-            if envs.FUSED_MOE_PREFILL_KERNEL
-            and not par.use_ep
-            and hidden % _PREFILL_Q_BLOCK == 0
+        # The prefill kernel's weight ring holds whole experts: TP experts only.
+        prefill_min_tokens=(
+            prefill_min_tokens()
+            if not par.use_ep and hidden % _PREFILL_Q_BLOCK == 0
             else None
         ),
     )
@@ -365,15 +372,12 @@ def _prefill_chain(
     x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, axis
 ):
     """The layer's output, summed over `axis`, from the fused MoE prefill
-    kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing, as
-    fused_moe_decode's prefill path calls it. GLM-5.2's shared expert is
-    ungated; routed_scale is folded into the route weights by the kernel."""
-    # Trace-time, once per token bucket: the evidence that the kernel serves it.
-    logger.info(
-        "moe_tp_decode: fused MoE prefill kernel traced for %d tokens", x.shape[0]
-    )
+    kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing. GLM-5.2's shared
+    expert is ungated; routed_scale is folded into the route weights by the
+    kernel."""
+    assert axis == EP_AXIS_NAME, (axis, EP_AXIS_NAME)
     w, ids = _route(scores, bias, is_pad, st, x.dtype)
-    return fused_moe_prefill(
+    return prefill_layer(
         x,
         w13,
         w2,
@@ -386,9 +390,8 @@ def _prefill_chain(
         None,
         w,
         ids.astype(jnp.int32),
-        axis_name=axis,
-        expert_start=None,
-        routed_scale=st.routed_scale,
+        None,
+        st.routed_scale,
     )
 
 
@@ -482,7 +485,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_ranks=n_ranks,
                 split_meta=envs.TPU_MOE_TP_DECODE_SPLIT_META,
             )
-        if statics.prefill_above is not None and n > statics.prefill_above:
+        if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
             return _prefill_chain(
                 x, scores, bias, is_pad, *weights, statics, axis
             ).astype(x.dtype)
