@@ -150,6 +150,35 @@ def _streamidx_block_sizes(
     )
 
 
+def _streamidx_mixed_short_block(
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+    decode_pack: bool,
+    split: bool,
+) -> tuple[int, int] | None:
+    """`streamindex_topk(mixed_short_block=...)` for a token bucket, or None.
+
+    TPU_STREAMIDX_MIXED_DECODE_SPLIT: a bucket above `small_bucket_tokens`
+    (the other side of `_streamidx_block_sizes`'s one `T > cap` gate, not a
+    new edge) runs its MIXED pass with a 128-row query block, so in a mixed
+    step every q_len gamma + 1 decode request scores 124 padding rows. Those
+    leading requests get the block sizes the largest small bucket uses (bq 4
+    packed under TPU_STREAMIDX_DECODE_PACK) in a pass of their own.
+    """
+    if not split or small_bucket_bq is None or num_tokens <= small_bucket_tokens:
+        return None
+    kv_pages, q_block = _streamidx_block_sizes(
+        small_bucket_tokens,
+        small_bucket_bq,
+        small_bucket_bkvp,
+        small_bucket_tokens,
+        decode_pack=decode_pack,
+    )
+    return q_block[2], kv_pages[2]
+
+
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
 
@@ -572,6 +601,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        mixed_decode_split = envs.TPU_STREAMIDX_MIXED_DECODE_SPLIT
         shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
@@ -649,6 +679,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 chunk_tokens=chunk_tokens,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                mixed_short_block=_streamidx_mixed_short_block(
+                    q.shape[0], *small_bucket, decode_pack, mixed_decode_split
+                ),
             )
             return cache_kv, topk_indices
 
@@ -676,6 +709,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode_chunked,
                 mixed_bkvp,
                 decode_pack,
+                mixed_decode_split,
                 shared_meta,
                 kv_cache_mode,
             ),
@@ -730,6 +764,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        mixed_decode_split = envs.TPU_STREAMIDX_MIXED_DECODE_SPLIT
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -836,6 +871,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                mixed_short_block=_streamidx_mixed_short_block(
+                    q.shape[0], *small_bucket, decode_pack, mixed_decode_split
+                ),
                 **overlap,
             )
             if qb_overlap:
