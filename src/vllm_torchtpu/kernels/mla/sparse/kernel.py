@@ -1411,6 +1411,7 @@ MIXED_BODY_LEVERS = (
     "q128",
     "pair",
     "xqk",
+    "pk",
 )
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
@@ -1452,10 +1453,11 @@ DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", 
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
-MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
-# Buckets up to this many tokens keep the plain live body: at 64 tokens the
-# levers measured within noise to +2.5 % (partly filled bucket).
-MIXED_BODY_MAX_SKIP_TOKENS = 64
+MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair", "pk")
+# Buckets up to this many tokens keep the plain live body (`T <= 32`; such
+# buckets take the decode path when the fused window prep serves them); every
+# larger live-group bucket runs the lever body.
+MIXED_BODY_MAX_SKIP_TOKENS = 32
 
 # TPU_DCP_MLA_SEND_LAYOUT: the decode kernel writes the DCP merge's packed
 # real-rows all-to-all send buffer itself. Each of the `world` destination
@@ -1771,6 +1773,10 @@ def _attention_kernel(
     #   "xqk"    transposed scores: s^T = kv . q^T [w, heads], softmax over
     #            sublanes, PV with a transposed-LHS contraction; the lse
     #            arrives lane-dense (not bit-exact: reduction order).
+    #   "pk"     (replaces "tr"'s shuffle) the same 4x4 byte transpose with
+    #            `pltpu.unpack_elementwise` / `pltpu.pack_elementwise` on the
+    #            four stride-4 row loads: byte b of keys 4s..4s+3 packed into
+    #            one word (vshrl + vpack instead of and/or/shift chains).
     # Every stage-A lever except "xqk" is bitwise-identical.
     assert not body_levers or group_tab_ref is not None or row_widths
     assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
@@ -2679,7 +2685,7 @@ def _attention_kernel(
         rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
         kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
         zu = "zu" in levers
-        if "tr" in levers:
+        if "tr" in levers or "pk" in levers:
             # Row r of the NOPE tile holds key r's 512 bytes as 128 words;
             # the fp8 tile wants each word to hold one byte column of four
             # consecutive keys. xs[j] = keys 4s + j (stride-4 rows).
@@ -2691,18 +2697,39 @@ def _attention_kernel(
                     jnp.where(key4 < kv_len - j, x, jnp.uint32(0))
                     for j, x in enumerate(xs)
                 ]
-            lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
-            ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
-            a0 = (xs[0] & lo16) | (xs[2] << 16)
-            a2 = (xs[0] >> 16) | (xs[2] & hi16)
-            a1 = (xs[1] & lo16) | (xs[3] << 16)
-            a3 = (xs[1] >> 16) | (xs[3] & hi16)
-            cols = [
-                (a0 & ev8) | ((a1 & ev8) << 8),  # byte 0 of keys 4s..4s+3
-                ((a0 >> 8) & ev8) | (a1 & od8),  # byte 1
-                (a2 & ev8) | ((a3 & ev8) << 8),  # byte 2
-                ((a2 >> 8) & ev8) | (a3 & od8),  # byte 3
-            ]
+            if "pk" in levers:
+                # Word s of column b = byte b of keys 4s, 4s+1, 4s+2, 4s+3
+                # (byte j <- key 4s + j): unpack byte b of each key's word,
+                # pack four.
+                xi = [pltpu.bitcast(x, jnp.int32) for x in xs]
+                cols = [
+                    pltpu.pack_elementwise(
+                        [
+                            pltpu.unpack_elementwise(
+                                x,
+                                index=b,
+                                packed_dtype=jnp.int8,
+                                unpacked_dtype=jnp.int32,
+                            )
+                            for x in xi
+                        ],
+                        packed_dtype=jnp.int8,
+                    )
+                    for b in range(4)
+                ]
+            else:
+                lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+                ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+                a0 = (xs[0] & lo16) | (xs[2] << 16)
+                a2 = (xs[0] >> 16) | (xs[2] & hi16)
+                a1 = (xs[1] & lo16) | (xs[3] << 16)
+                a3 = (xs[1] >> 16) | (xs[3] & hi16)
+                cols = [
+                    (a0 & ev8) | ((a1 & ev8) << 8),  # byte 0 of keys 4s..4s+3
+                    ((a0 >> 8) & ev8) | (a1 & od8),  # byte 1
+                    (a2 & ev8) | ((a3 & ev8) << 8),  # byte 2
+                    ((a2 >> 8) & ev8) | (a3 & od8),  # byte 3
+                ]
             bkv_nope = jnp.concatenate(
                 [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
             )

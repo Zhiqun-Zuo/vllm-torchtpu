@@ -1221,6 +1221,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     # TPU_DCP_MLA_MIXED_KERNEL_V2 stage-A levers (exact).
                     ("fxskip",),
                     ("pair",),
+                    ("pk",),
                     sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS,
                 )
             ),
